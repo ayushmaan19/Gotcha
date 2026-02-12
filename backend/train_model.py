@@ -1,23 +1,21 @@
 """
-SDP-1: Integrity Model Trainer
-================================
-Trains a RandomForestClassifier on biometric features and saves the model
-as `integrity_model.pkl`.
+SDP-1: Integrity Model Trainer (Hybrid Edition)
+===============================================
+Trains a RandomForestClassifier by FUSING:
+1. Real Data (Your Face) - for personalization
+2. Synthetic Data (General Rules) - for robustness
 
-Expected CSV schema
-───────────────────
-  yaw       : float  — Head yaw angle in degrees (0 = centre)
-  ear       : float  — Eye Aspect Ratio (≈0.25 open, <0.20 blink)
-  volume    : float  — RMS audio energy (0.0–1.0)
-  label     : int    — 0 = legitimate,  1 = suspicious
+Expected CSV schema:
+  yaw       : float  - Head yaw angle in degrees (0 = centre)
+  ear       : float  - Eye Aspect Ratio (approx 0.25 open, <0.20 blink)
+  volume    : float  - RMS audio energy (0.0-1.0)
+  label     : int    - 0 = legitimate, 1 = suspicious
 
-Usage
-─────
-  # 1. Put your dataset next to this file (or pass a path):
-  python train_model.py                         # uses data.csv in cwd
-  python train_model.py --csv /path/to/data.csv
+Usage:
+  python train_model.py                         # synthetic only (baseline)
+  python train_model.py --csv my_face_data.csv  # HYBRID: real + synthetic
 
-  # 2. The trained model is saved as integrity_model.pkl
+  The trained model is saved as integrity_model.pkl
 """
 
 import argparse
@@ -113,25 +111,37 @@ def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
 def train(csv_path: str | None = None):
     """Load data, engineer features, train model, evaluate, and save."""
 
-    # ── 1. Load or generate data ─────────────────────────────────────────
+    # ── 1. Load Real Data (if available) ────────────────────────────────
+    real_df = pd.DataFrame()
     if csv_path and os.path.isfile(csv_path):
-        print(f"[*] Loading dataset from: {csv_path}")
-        df = pd.read_csv(csv_path)
+        print(f"[*] Loading REAL dataset from: {csv_path}")
+        real_df = pd.read_csv(csv_path)
         required = {"yaw", "ear", "volume", "label"}
-        missing = required - set(df.columns)
+        missing = required - set(real_df.columns)
         if missing:
             print(f"[!] CSV is missing columns: {missing}")
             sys.exit(1)
+        print(f"    → Loaded {len(real_df)} real samples.")
     else:
         if csv_path:
-            print(f"[!] File not found: {csv_path}")
-        print("[*] Generating synthetic dataset (2 000 samples) ...")
-        df = generate_synthetic_dataset()
-        # Save so the user can inspect / extend it
-        df.to_csv("data.csv", index=False)
-        print(f"    → Saved synthetic data to data.csv")
+            print(f"[!] Warning: No real file found at '{csv_path}'. Using synthetic only.")
 
-    print(f"[*] Dataset shape: {df.shape}")
+    # ── 2. Generate Synthetic Data (General Knowledge) ──────────────────
+    # 1000 samples to stabilize the model without drowning real data
+    print("[*] Generating synthetic dataset (1,000 samples) for robustness...")
+    synth_df = generate_synthetic_dataset(n_samples=1000)
+
+    # ── 3. Merge Them (The Hybrid Strategy) ─────────────────────────────
+    if not real_df.empty:
+        print("[*] MERGING Real + Synthetic Data...")
+        df = pd.concat([real_df, synth_df], ignore_index=True)
+    else:
+        df = synth_df
+        # Save synthetic so user can inspect it
+        df.to_csv("data.csv", index=False)
+        print("    → Saved synthetic data to data.csv")
+
+    print(f"[*] Total Dataset shape: {df.shape}")
     print(f"    Class distribution:\n{df['label'].value_counts().to_string()}\n")
 
     # ── 2. Feature engineering ───────────────────────────────────────────
@@ -194,7 +204,12 @@ def train(csv_path: str | None = None):
     with open(MODEL_OUT, "wb") as f:
         pickle.dump(payload, f)
 
-    print(f"\n[✓] Model saved to {MODEL_OUT}")
+    # Count real vs synthetic samples used
+    real_count = len(real_df) if not real_df.empty else 0
+    synth_count = len(synth_df)
+    
+    print(f"\n[✓] HYBRID Model saved to {MODEL_OUT}")
+    print(f"    Using {real_count} real samples + {synth_count} synthetic samples.")
     print(f"    Features: {feature_cols}")
     print(f"    To load:  pickle.load(open('{MODEL_OUT}', 'rb'))")
 
@@ -202,7 +217,7 @@ def train(csv_path: str | None = None):
 # ── CLI ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train the SDP-1 Integrity classifier"
+        description="Train the Hybrid Integrity classifier"
     )
     parser.add_argument(
         "--csv", type=str, default=DEFAULT_CSV,

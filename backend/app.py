@@ -111,6 +111,10 @@ W_GAZE = st.sidebar.slider("Gaze Weight", 0.1, 0.7, 0.4)
 W_VOICE = st.sidebar.slider("Voice Weight", 0.1, 0.5, 0.3)
 W_FACE = st.sidebar.slider("Face Weight", 0.1, 0.5, 0.3)
 
+st.sidebar.markdown("### 🧮 Fusion Mode")
+USE_HARMONIC = st.sidebar.checkbox("Use Adaptive Harmonic Fusion", value=True,
+    help="Stricter math: single-mode failure crashes the score")
+
 st.sidebar.markdown("---")
 st.sidebar.info("System Status: **ONLINE**")
 
@@ -141,8 +145,31 @@ class IntegrityState:
         # Seed initial data point
         self.score_history.append(100.0)
         self.time_history.append(0.0)
+        
+        # Calibration Baselines (for personalized detection)
+        self.is_calibrated = False
+        self.is_calibrating = False
+        self.base_yaw = 0.0
+        self.base_ear = 0.3
+        self.base_pitch = 0.0
+        
+        # Adaptive Fusion State (tracks anomaly duration)
+        self.anomaly_duration = 0.0
+        
+        # Thread-safe fusion settings (copied from sidebar)
+        self.use_harmonic = True
+        self.w_gaze = 0.4
+        self.w_voice = 0.3
+        self.w_face = 0.3
 
 global_state = IntegrityState()
+
+# Sync sidebar settings to thread-safe state
+with global_state.lock:
+    global_state.use_harmonic = USE_HARMONIC
+    global_state.w_gaze = W_GAZE
+    global_state.w_voice = W_VOICE
+    global_state.w_face = W_FACE
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -198,6 +225,59 @@ def compute_landmark_variance(history):
     """
     if len(history) < 2:
         return 1.0  # assume alive until enough data
+    
+    # Stack all frames: shape (num_frames, num_landmarks, 2)
+    arr = np.array(history)
+    # Variance across frames for each landmark coordinate
+    var = np.var(arr, axis=0)
+    # Average variance across all landmarks and x/y
+    mean_var = np.mean(var)
+    return float(mean_var)
+
+
+def adaptive_harmonic_fusion(gaze_score, voice_score, face_score, anomaly_time,
+                              w_gaze=0.4, w_voice=0.3, w_face=0.3):
+    """
+    Novel Algorithm: Adaptive Harmonic Fusion (AHF)
+    
+    Unlike arithmetic means, harmonic mean penalizes single-mode failures heavily.
+    If any sensor drops to near-zero, the entire score collapses (Zero-Trust).
+    
+    Args:
+        gaze_score: 0-100 gaze integrity
+        voice_score: 0-100 voice integrity  
+        face_score: 0-100 face integrity
+        anomaly_time: seconds of continuous anomaly state
+        w_gaze, w_voice, w_face: weight parameters
+    
+    Returns:
+        int: fused integrity score 0-100
+    """
+    # 1. Normalize inputs to 0.01 - 1.0 (Avoid division by zero)
+    g = max(1.0, gaze_score) / 100.0
+    v = max(1.0, voice_score) / 100.0
+    f = max(1.0, face_score) / 100.0
+    
+    # 2. Dynamic Weights (Reliability-Based)
+    # If a sensor is very low, we trust it MORE (Zero-Trust Principle)
+    w_g = w_gaze + (0.1 if g < 0.5 else 0)
+    w_v = w_voice + (0.1 if v < 0.5 else 0)
+    w_f = w_face + (0.1 if f < 0.5 else 0)
+    total_w = w_g + w_v + w_f
+    
+    # 3. Harmonic Mean Calculation
+    # Formula: Sum(w) / Sum(w/x)  - mathematically "pessimistic"
+    try:
+        harmonic_mean = total_w / ((w_g / g) + (w_v / v) + (w_f / f))
+    except ZeroDivisionError:
+        harmonic_mean = 0.0
+        
+    # 4. Temporal Decay (The longer you cheat, the lower the score gets)
+    # Penalty grows with time: 1s=1.0, 3s=0.55, 5s=0.25, 7s=0.0
+    decay_factor = max(0.0, 1.0 - (0.15 * anomaly_time))
+    
+    final_score = harmonic_mean * decay_factor * 100.0
+    return int(max(0, min(100, final_score)))
     arr = np.array(history)            # shape (T, N, 2)
     var = np.var(arr, axis=0).mean()   # average variance across landmarks & axes
     return float(var)
@@ -558,12 +638,40 @@ class BiometricAnalyzer(VideoProcessorBase):
             shimmer_val = global_state.shimmer
 
         # ── FUSED INTEGRITY SCORE ────────────────────────────────────────
-        total_w = W_GAZE + W_VOICE + W_FACE
-        fused = (
-            (W_GAZE * self.gaze_score)
-            + (W_VOICE * voice_score)
-            + (W_FACE * self.face_score)
-        ) / total_w
+        
+        # Track anomaly duration for temporal decay
+        is_anomaly = (self.gaze_score < 50) or (voice_score < 50) or (self.face_score < 50)
+        
+        with global_state.lock:
+            if is_anomaly:
+                # Increase timer (assuming ~30 FPS, add ~0.033s per frame)
+                global_state.anomaly_duration += 0.033
+            else:
+                # Recovery (cool down slowly)
+                global_state.anomaly_duration = max(0.0, global_state.anomaly_duration - 0.1)
+            anomaly_time = global_state.anomaly_duration
+        
+        # Choose fusion method based on thread-safe state
+        with global_state.lock:
+            use_harmonic = global_state.use_harmonic
+            w_gaze = global_state.w_gaze
+            w_voice = global_state.w_voice
+            w_face = global_state.w_face
+        
+        if use_harmonic:
+            # Adaptive Harmonic Fusion (strict, zero-trust)
+            fused = adaptive_harmonic_fusion(
+                self.gaze_score, voice_score, self.face_score,
+                anomaly_time, w_gaze, w_voice, w_face
+            )
+        else:
+            # Classic weighted average (lenient)
+            total_w = w_gaze + w_voice + w_face
+            fused = (
+                (w_gaze * self.gaze_score)
+                + (w_voice * voice_score)
+                + (w_face * self.face_score)
+            ) / total_w
 
         # ── Multimodal synergy penalties (whitepaper Section 4) ──────────
         # "Looking away AND voice trembling -> -40 (Coercion Red Alert)"

@@ -11,10 +11,42 @@ Fusion: Weighted Sum Rule  0.4*Gaze + 0.3*Voice + 0.3*Face
 """
 
 # ── Imports ──────────────────────────────────────────────────────────────────
+import sys
+import streamlit as st
+
+# Guard: mediapipe >=0.10.21 dropped the solutions module, and 0.10.14
+# (the last version with solutions) has no wheel for Python 3.13+.
+# Detect this at startup and show a helpful Streamlit error instead of crashing.
+try:
+    import mediapipe as mp
+    _probe = mp.solutions.face_mesh          # will raise AttributeError if missing
+except (AttributeError, ImportError) as _err:
+    st.set_page_config(page_title="SDP-1: Environment Error", layout="centered")
+    st.error("## Incompatible MediaPipe version")
+    st.markdown(
+        f"""
+        Your current Python is **{sys.version.split()[0]}** (`{sys.executable}`).
+
+        MediaPipe **{getattr(mp, '__version__', '?')}** installed here does **not**
+        include the `solutions` module required by this app.
+
+        **Fix — run with the project venv instead:**
+        ```bash
+        cd backend
+        /Users/ayushmaankumaryadav/Desktop/gotcha/.venv/bin/python -m streamlit run app.py
+        ```
+        Or create a shortcut:
+        ```bash
+        alias gotcha='/Users/ayushmaankumaryadav/Desktop/gotcha/.venv/bin/python -m streamlit run'
+        gotcha app.py
+        ```
+        """
+    )
+    st.stop()
+
 import cv2
 import av
 import numpy as np
-import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
@@ -22,17 +54,20 @@ mp_face_mesh = mp.solutions.face_mesh
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
 
-import streamlit as st
 import time
 import threading
 import collections
+import os
+from datetime import datetime
 
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, AudioProcessorBase
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, AudioProcessorBase, RTCConfiguration
 import librosa
+import plotly.graph_objects as go
 
 # ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="SDP-1: Biometric Integrity",
+    page_title="SDP-1: Threat Command Center",
+    page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -82,7 +117,7 @@ st.sidebar.info("System Status: **ONLINE**")
 
 # ── Shared Thread-Safe State ────────────────────────────────────────────────
 class IntegrityState:
-    """Communicates audio analysis results to the video thread."""
+    """Communicates analysis results across threads + to dashboard."""
     def __init__(self):
         self.lock = threading.Lock()
         # Raw metrics
@@ -93,6 +128,19 @@ class IntegrityState:
         self.mfcc_flatness = 0.0
         # Derived sub-score (0-100, 100 = normal)
         self.voice_score = 100.0
+        # Dashboard-facing values (written by BiometricAnalyzer)
+        self.integrity_score = 100.0
+        self.gaze_score = 100.0
+        self.face_score = 100.0
+        self.status_msg = "INITIALISING"
+        self.anomaly_count = 0
+        self.score_history = collections.deque(maxlen=120)  # ~60s at 2Hz
+        self.time_history = collections.deque(maxlen=120)
+        self.session_start = time.time()
+        self.last_history_update = 0.0  # track when history was last updated
+        # Seed initial data point
+        self.score_history.append(100.0)
+        self.time_history.append(0.0)
 
 global_state = IntegrityState()
 
@@ -310,8 +358,11 @@ class BiometricAnalyzer(VideoProcessorBase):
 
         # ── Object Detector ──────────────────────────────────────────────
         try:
+            # Resolve model path relative to this script
+            _dir = os.path.dirname(os.path.abspath(__file__))
+            _model = os.path.join(_dir, "efficientdet_lite0.tflite")
             base_opts = python.BaseOptions(
-                model_asset_path="backend/efficientdet_lite0.tflite"
+                model_asset_path=_model
             )
             opts = vision.ObjectDetectorOptions(
                 base_options=base_opts, score_threshold=0.4
@@ -525,6 +576,19 @@ class BiometricAnalyzer(VideoProcessorBase):
 
         self.integrity_score = max(0.0, min(100.0, fused))
 
+        # ── Push to shared dashboard state ────────────────────────────
+        with global_state.lock:
+            global_state.integrity_score = self.integrity_score
+            global_state.gaze_score = self.gaze_score
+            global_state.face_score = self.face_score
+            if self.frame_count % 15 == 0:  # ~2 Hz sample rate for graph
+                elapsed = time.time() - global_state.session_start
+                global_state.score_history.append(self.integrity_score)
+                global_state.time_history.append(elapsed)
+                global_state.last_history_update = elapsed
+            if self.integrity_score < 50:
+                global_state.anomaly_count += 1
+
         # ── Status message ───────────────────────────────────────────────
         if suspicious_object_found:
             self.status_msg = "DEVICE: " + forbidden_label
@@ -554,6 +618,10 @@ class BiometricAnalyzer(VideoProcessorBase):
         else:
             self.status_msg = "VERIFIED"
             self.status_color = (0, 255, 0)
+
+        # Sync status to dashboard
+        with global_state.lock:
+            global_state.status_msg = self.status_msg
 
         # ══════════════════════════════════════════════════════════════════
         #  HUD OVERLAY
@@ -591,37 +659,320 @@ class BiometricAnalyzer(VideoProcessorBase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  STREAMLIT LAYOUT
+#  RTC CONFIGURATION (Cloud Deployment)
 # ══════════════════════════════════════════════════════════════════════════════
 
-st.title("SDP-1: Real-Time Multimodal Biometric Integrity")
-st.caption("Continuous authentication via Face Liveness - Gaze Attention - Voice Forensics - Object Detection")
+RTC_CONFIG = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
 
-col1, col2 = st.columns([3, 1])
 
-with col1:
-    webrtc_streamer(
+# ══════════════════════════════════════════════════════════════════════════════
+#  CUSTOM CSS — Dark Cybersecurity Theme
+# ══════════════════════════════════════════════════════════════════════════════
+
+DARK_CSS = """
+<style>
+/* ── Global dark overrides ─────────────────────────────────────────────── */
+.stApp {
+    background-color: #0a0e17;
+    color: #c5cdd9;
+}
+section[data-testid="stSidebar"] {
+    background-color: #0d1220 !important;
+    border-right: 1px solid #1a2744;
+}
+section[data-testid="stSidebar"] .stMarkdown h3 {
+    color: #4fc3f7;
+}
+
+/* ── KPI metric cards ──────────────────────────────────────────────────── */
+div[data-testid="stMetric"] {
+    background: linear-gradient(135deg, #0d1b2a 0%, #1b2838 100%);
+    border: 1px solid #1e3a5f;
+    border-radius: 12px;
+    padding: 16px 20px;
+    box-shadow: 0 0 20px rgba(0,150,255,0.08);
+}
+div[data-testid="stMetric"] label {
+    color: #7eb8da !important;
+    font-size: 0.85rem !important;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+}
+div[data-testid="stMetric"] div[data-testid="stMetricValue"] {
+    font-size: 2rem !important;
+    font-weight: 700;
+}
+
+/* ── Title styling ─────────────────────────────────────────────────────── */
+.dashboard-title {
+    font-size: 1.6rem;
+    font-weight: 800;
+    color: #e0e6ed;
+    letter-spacing: 2px;
+    border-bottom: 2px solid #1e3a5f;
+    padding-bottom: 10px;
+    margin-bottom: 6px;
+}
+.dashboard-subtitle {
+    color: #5a7994;
+    font-size: 0.85rem;
+    margin-bottom: 18px;
+}
+
+/* ── Flashing alert for SUSPICIOUS status ──────────────────────────────── */
+@keyframes threat-pulse {
+    0%   { opacity: 1; }
+    50%  { opacity: 0.3; }
+    100% { opacity: 1; }
+}
+.threat-flash {
+    animation: threat-pulse 0.8s ease-in-out infinite;
+    color: #ff1744 !important;
+    font-weight: 900;
+    font-size: 1.4rem;
+    text-shadow: 0 0 16px rgba(255,23,68,0.6);
+}
+.status-secure {
+    color: #00e676;
+    font-weight: 700;
+    font-size: 1.4rem;
+    text-shadow: 0 0 12px rgba(0,230,118,0.4);
+}
+
+/* ── Module status pills ───────────────────────────────────────────────── */
+.module-pill {
+    display: inline-block;
+    background: #12202f;
+    border: 1px solid #1e3a5f;
+    border-radius: 8px;
+    padding: 8px 14px;
+    margin: 4px 0;
+    font-size: 0.78rem;
+    color: #90caf9;
+    width: 100%;
+}
+.module-pill .dot {
+    display: inline-block;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #00e676;
+    margin-right: 8px;
+    box-shadow: 0 0 6px #00e676;
+}
+
+/* ── Plotly chart container ────────────────────────────────────────────── */
+.stPlotlyChart {
+    border: 1px solid #1e3a5f;
+    border-radius: 10px;
+    overflow: hidden;
+}
+</style>
+"""
+
+st.markdown(DARK_CSS, unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DASHBOARD RENDERING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_live_chart(times, scores):
+    """Build a Plotly line chart of Integrity Score over the last ~60 s."""
+    fig = go.Figure()
+
+    # Score trace
+    fig.add_trace(go.Scatter(
+        x=list(times), y=list(scores),
+        mode="lines",
+        line=dict(color="#00e5ff", width=2.5),
+        fill="tozeroy",
+        fillcolor="rgba(0,229,255,0.07)",
+        name="Integrity",
+    ))
+
+    # Failure threshold line
+    if times:
+        fig.add_hline(
+            y=50, line_dash="dash", line_color="#ff1744", line_width=1.5,
+            annotation_text="FAIL THRESHOLD",
+            annotation_position="top left",
+            annotation_font_color="#ff1744",
+            annotation_font_size=10,
+        )
+
+    fig.update_layout(
+        height=280,
+        margin=dict(l=0, r=0, t=20, b=0),
+        paper_bgcolor="#0d1b2a",
+        plot_bgcolor="#0d1b2a",
+        font=dict(color="#7eb8da", size=11),
+        xaxis=dict(
+            title="Session Time (s)",
+            gridcolor="#1e3a5f",
+            zerolinecolor="#1e3a5f",
+        ),
+        yaxis=dict(
+            title="Score", range=[0, 105],
+            gridcolor="#1e3a5f",
+            zerolinecolor="#1e3a5f",
+        ),
+        showlegend=False,
+    )
+    return fig
+
+
+def draw_dashboard(score, status, anomaly_count, gaze, face, voice,
+                   audio_msg, times, scores,
+                   kpi_ph, chart_ph, subscore_ph, frame=0):
+    """Update only the live dashboard placeholders (called in a loop)."""
+
+    # ── KPI Row ──────────────────────────────────────────────────────────
+    with kpi_ph.container():
+        k1, k2, k3 = st.columns(3)
+        score_delta = f"{score - 100:+.0f}" if score < 100 else "Nominal"
+        with k1:
+            st.metric("INTEGRITY SCORE", f"{int(score)}%", delta=score_delta,
+                      delta_color="inverse")
+        with k2:
+            st.metric("ANOMALY COUNT", str(anomaly_count),
+                      delta=f"{anomaly_count} events", delta_color="off")
+        with k3:
+            is_secure = score >= 50
+            status_label = status if status != "INITIALISING" else "STANDBY"
+            if is_secure:
+                st.markdown(f'<p style="margin:0;color:#7eb8da;font-size:0.85rem;'
+                            f'text-transform:uppercase;letter-spacing:1.2px;">'
+                            f'SESSION STATUS</p>'
+                            f'<p class="status-secure">{status_label}</p>',
+                            unsafe_allow_html=True)
+            else:
+                st.markdown(f'<p style="margin:0;color:#7eb8da;font-size:0.85rem;'
+                            f'text-transform:uppercase;letter-spacing:1.2px;">'
+                            f'SESSION STATUS</p>'
+                            f'<p class="threat-flash">⚠ {status_label}</p>',
+                            unsafe_allow_html=True)
+
+    # ── Live Chart ───────────────────────────────────────────────────────
+    chart_ph.empty()
+    with chart_ph.container():
+        st.markdown("##### 📈 Integrity Timeline")
+        st.plotly_chart(
+            build_live_chart(times, scores),
+            use_container_width=True,
+            config={"displayModeBar": False},
+            key=f"integrity_chart_{frame}",
+        )
+
+    # ── Sub-scores ───────────────────────────────────────────────────────
+    with subscore_ph.container():
+        st.markdown("##### 🔬 Sub-Score Breakdown")
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("Gaze", f"{int(gaze)}")
+        sc2.metric("Face", f"{int(face)}")
+        sc3.metric("Voice", f"{int(voice)}")
+        st.caption(f"Audio: {audio_msg}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STREAMLIT LAYOUT — static elements + live-updating placeholders
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Title (static) ───────────────────────────────────────────────────────
+st.markdown('<div class="dashboard-title">🛡️ SDP-1 &mdash; THREAT COMMAND CENTER</div>', unsafe_allow_html=True)
+st.markdown('<div class="dashboard-subtitle">Real-Time Multimodal Biometric Integrity Analysis &bull; Face Liveness &bull; Gaze Attention &bull; Voice Forensics &bull; Object Detection</div>', unsafe_allow_html=True)
+
+# ── KPI placeholder (updates every second) ───────────────────────────────
+kpi_placeholder = st.empty()
+
+st.markdown("")
+
+# ── Main area: Video (2/3) + Chart + Sub-scores (1/3) ───────────────────
+vid_col, chart_col = st.columns([2, 1])
+
+with vid_col:
+    webrtc_ctx = webrtc_streamer(
         key="integrity-engine",
         video_processor_factory=BiometricAnalyzer,
         audio_processor_factory=AudioAnalyzer,
+        rtc_configuration=RTC_CONFIG,
         media_stream_constraints={"video": True, "audio": True},
         async_processing=True,
     )
 
-with col2:
-    st.markdown("#### Module Status")
-    st.success("A — Visual Liveness (Face Mesh 478 + Micro-expression Variance)")
-    st.success("B — Ocular Attention (EAR Blink + Gaze Vector + Lie Detection)")
-    st.success("C — Audio Forensics (Jitter + Shimmer + MFCC + Spectral Centroid)")
-    st.success("D — Object Detection (EfficientDet-Lite0 Banned Devices)")
+with chart_col:
+    chart_placeholder = st.empty()
+    subscore_placeholder = st.empty()
 
-    st.markdown("---")
-    st.markdown("#### Fusion Formula")
-    st.latex(r"\text{Score} = \frac{w_g \cdot G + w_v \cdot V + w_f \cdot F}{w_g + w_v + w_f}")
-    st.caption(f"Weights — Gaze: {W_GAZE} | Voice: {W_VOICE} | Face: {W_FACE}")
+# ── Bottom row (static) ─────────────────────────────────────────────────
+st.markdown("---")
+b1, b2, b3 = st.columns([2, 2, 1])
 
-    st.markdown("---")
-    st.markdown("#### Synergy Alerts")
-    st.error("**Coercion**: Distracted gaze + Voice jitter = **-40 pts**")
-    st.warning("**Deepfake**: Frozen landmarks + Low blink = **Face score drain**")
-    st.info("**Cheating**: Device detected = **-30 pts immediate**")
+with b1:
+    st.markdown("##### Active Modules")
+    modules = [
+        ("A", "Visual Liveness", "Face Mesh 478 + Micro-expression"),
+        ("B", "Ocular Attention", "EAR Blink + Gaze Vector + Lie"),
+        ("C", "Audio Forensics", "Jitter + Shimmer + MFCC + Spectral"),
+        ("D", "Object Detection", "EfficientDet-Lite0 Banned Devices"),
+    ]
+    for code, name, desc in modules:
+        st.markdown(
+            f'<div class="module-pill"><span class="dot"></span>'
+            f'<strong>{code}</strong> &mdash; {name} '
+            f'<span style="color:#5a7994">({desc})</span></div>',
+            unsafe_allow_html=True,
+        )
+
+with b2:
+    st.markdown("##### Synergy Alert Rules")
+    st.error("**Coercion**: Distracted gaze + Voice jitter → **-40 pts**")
+    st.warning("**Deepfake**: Frozen landmarks + Low blink → **Face drain**")
+    st.info("**Cheating**: Banned device detected → **-30 pts**")
+
+with b3:
+    st.markdown("##### Fusion")
+    st.latex(r"\small I = \frac{w_g G + w_v V + w_f F}{\Sigma w}")
+    st.caption(f"w_g={W_GAZE}  w_v={W_VOICE}  w_f={W_FACE}")
+
+# ── Live update loop — polls global_state every second ───────────────────
+_frame_counter = 0
+while True:
+    with global_state.lock:
+        _score     = global_state.integrity_score
+        _status    = global_state.status_msg
+        _anomalies = global_state.anomaly_count
+        _gaze      = global_state.gaze_score
+        _face      = global_state.face_score
+        _voice     = global_state.voice_score
+        _audio_msg = global_state.audio_msg
+        
+        # Add data point if video processor hasn't updated recently (keeps graph alive)
+        elapsed = time.time() - global_state.session_start
+        if elapsed - global_state.last_history_update > 0.5:
+            global_state.score_history.append(_score)
+            global_state.time_history.append(elapsed)
+            global_state.last_history_update = elapsed
+        
+        _times     = list(global_state.time_history)
+        _scores    = list(global_state.score_history)
+
+    draw_dashboard(
+        score=_score,
+        status=_status,
+        anomaly_count=_anomalies,
+        gaze=_gaze,
+        face=_face,
+        voice=_voice,
+        audio_msg=_audio_msg,
+        times=_times,
+        scores=_scores,
+        kpi_ph=kpi_placeholder,
+        chart_ph=chart_placeholder,
+        subscore_ph=subscore_placeholder,
+        frame=_frame_counter,
+    )
+
+    _frame_counter += 1
+    time.sleep(1)

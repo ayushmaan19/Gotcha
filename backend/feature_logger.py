@@ -197,16 +197,15 @@ class FeatureLogger:
 
 
 # Convenience function for extracting features from global_state
-def extract_features_from_state(global_state, object_detected: bool = False) -> dict:
+def extract_features_from_state(global_state) -> dict:
     """
     Extract loggable features from IntegrityState object.
     
     Args:
         global_state: The IntegrityState instance
-        object_detected: Whether a banned object was detected this frame
     
     Returns:
-        dict: Features ready for logging
+        dict: Features ready for logging (live values from global_state)
     """
     with global_state.lock:
         return {
@@ -218,6 +217,6 @@ def extract_features_from_state(global_state, object_detected: bool = False) -> 
             "shimmer": global_state.shimmer,
             "spectral_centroid": global_state.spectral_centroid,
             "anomaly_duration": global_state.anomaly_duration,
-            "object_flag": int(object_detected),
+            "object_flag": int(getattr(global_state, "object_flag", False)),
             "final_integrity_score": global_state.integrity_score,
         }

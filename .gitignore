@@ -3,9 +3,12 @@ venv/
 backend/venv/
 __pycache__/
 *.pyc
+.DS_Store
 
 # Node
 node_modules/
 
 # Env
 .env
+backend/dataset_logs/
+backend/dataset_raw/

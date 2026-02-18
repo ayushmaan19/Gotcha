@@ -178,6 +178,9 @@ class IntegrityState:
         # Micro-expression variance (copied from BiometricAnalyzer for logging)
         self.micro_var = 1.0
         
+        # Object detection flag (copied from BiometricAnalyzer for logging)
+        self.object_flag = False
+        
         # Thread-safe fusion settings (copied from sidebar)
         self.use_harmonic = True
         self.use_ml_fusion = False
@@ -185,7 +188,10 @@ class IntegrityState:
         self.w_voice = 0.3
         self.w_face = 0.3
 
-global_state = IntegrityState()
+# Persist global_state across Streamlit reruns (critical for logging)
+if "global_state" not in st.session_state:
+    st.session_state.global_state = IntegrityState()
+global_state = st.session_state.global_state
 
 # Sync sidebar settings to thread-safe state
 with global_state.lock:
@@ -810,6 +816,7 @@ class BiometricAnalyzer(VideoProcessorBase):
             global_state.gaze_score = self.gaze_score
             global_state.face_score = self.face_score
             global_state.micro_var = self.micro_var  # For feature logging
+            global_state.object_flag = suspicious_object_found  # For feature logging
             if self.frame_count % 15 == 0:  # ~2 Hz sample rate for graph
                 elapsed = time.time() - global_state.session_start
                 global_state.score_history.append(self.integrity_score)
@@ -1199,10 +1206,14 @@ while True:
         _times     = list(global_state.time_history)
         _scores    = list(global_state.score_history)
 
-    # Dataset logging (modular, non-blocking)
-    if st.session_state.feature_logger is not None:
+    # Dataset logging (modular, non-blocking) — only when WebRTC is streaming
+    if st.session_state.feature_logger is not None and webrtc_ctx.state.playing:
         features = extract_features_from_state(global_state)
         st.session_state.feature_logger.log_features(features, LOGGING_LABEL_INT)
+        # Debug: print logged values to console
+        print(f"[LOG] gaze={features['gaze_score']:.1f} face={features['face_score']:.1f} voice={features['voice_score']:.1f} "
+              f"micro={features['micro_var']:.4f} jitter={features['jitter']:.2f} shimmer={features['shimmer']:.2f} "
+              f"anomaly={features['anomaly_duration']:.2f} obj={features['object_flag']} label={LOGGING_LABEL_INT}")
 
     draw_dashboard(
         score=_score,
@@ -1222,4 +1233,3 @@ while True:
 
     _frame_counter += 1
     time.sleep(1)
-cd backend && python3 train_model.pycd backend && python3 train_model.py

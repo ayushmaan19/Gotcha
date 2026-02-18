@@ -16,6 +16,8 @@ import csv
 import cv2
 import mediapipe as mp
 import numpy as np
+import os
+import re
 
 # ── MediaPipe Setup ──────────────────────────────────────────────────────────
 mp_face_mesh = mp.solutions.face_mesh
@@ -59,8 +61,24 @@ def calculate_yaw(landmarks):
     return 0.0
 
 
-# ── CSV Setup ────────────────────────────────────────────────────────────────
-csv_file = open("my_face_data.csv", "w", newline="")
+# ── CSV Setup (Auto-Increment Session Numbering) ────────────────────────────
+DATASET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset_raw")
+os.makedirs(DATASET_DIR, exist_ok=True)
+
+# Find next available session number
+existing_nums = []
+if os.path.isdir(DATASET_DIR):
+    for fname in os.listdir(DATASET_DIR):
+        match = re.match(r"person_(\d+)\.csv$", fname)
+        if match:
+            existing_nums.append(int(match.group(1)))
+
+next_num = max(existing_nums, default=0) + 1
+csv_filename = os.path.join(DATASET_DIR, f"person_{next_num}.csv")
+
+print(f"Saving data to: dataset_raw/person_{next_num}.csv")
+
+csv_file = open(csv_filename, "w", newline="")
 writer = csv.writer(csv_file)
 writer.writerow(["yaw", "ear", "volume", "label"])
 
@@ -157,9 +175,9 @@ cv2.destroyAllWindows()
 csv_file.close()
 
 print("\n" + "=" * 60)
-print(f"Data saved to my_face_data.csv")
+print(f"Data saved to: dataset_raw/person_{next_num}.csv")
 print(f"Total samples: {legit_count + sus_count}")
 print(f"  Legitimate: {legit_count}")
 print(f"  Suspicious: {sus_count}")
 print("=" * 60)
-print("\nNext step: python train_model.py --csv my_face_data.csv")
+print(f"\nNext step: python train_model.py --csv dataset_raw/person_{next_num}.csv")

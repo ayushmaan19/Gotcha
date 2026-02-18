@@ -59,10 +59,14 @@ import threading
 import collections
 import os
 from datetime import datetime
+import pickle
 
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, AudioProcessorBase, RTCConfiguration
 import librosa
 import plotly.graph_objects as go
+
+# Feature logging for dataset collection (modular addition)
+from feature_logger import FeatureLogger, extract_features_from_state
 
 # ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -115,6 +119,21 @@ st.sidebar.markdown("### 🧮 Fusion Mode")
 USE_HARMONIC = st.sidebar.checkbox("Use Adaptive Harmonic Fusion", value=True,
     help="Stricter math: single-mode failure crashes the score")
 
+st.sidebar.markdown("### 📊 Dataset Collection")
+ENABLE_LOGGING = st.sidebar.checkbox("Enable Dataset Logging", value=False,
+    help="Log features to CSV for training")
+LOGGING_LABEL = st.sidebar.radio(
+    "Current Label",
+    options=["Legitimate", "Suspicious"],
+    horizontal=True,
+    help="Label for logged samples"
+) if ENABLE_LOGGING else "Legitimate"
+LOGGING_LABEL_INT = 0 if LOGGING_LABEL == "Legitimate" else 1
+
+st.sidebar.markdown("### 🤖 ML Fusion (Optional)")
+USE_ML_FUSION = st.sidebar.checkbox("Use Trained ML Fusion", value=False,
+    help="Use fusion_model.pkl instead of harmonic fusion")
+
 st.sidebar.markdown("---")
 st.sidebar.info("System Status: **ONLINE**")
 
@@ -156,8 +175,12 @@ class IntegrityState:
         # Adaptive Fusion State (tracks anomaly duration)
         self.anomaly_duration = 0.0
         
+        # Micro-expression variance (copied from BiometricAnalyzer for logging)
+        self.micro_var = 1.0
+        
         # Thread-safe fusion settings (copied from sidebar)
         self.use_harmonic = True
+        self.use_ml_fusion = False
         self.w_gaze = 0.4
         self.w_voice = 0.3
         self.w_face = 0.3
@@ -167,9 +190,76 @@ global_state = IntegrityState()
 # Sync sidebar settings to thread-safe state
 with global_state.lock:
     global_state.use_harmonic = USE_HARMONIC
+    global_state.use_ml_fusion = USE_ML_FUSION
     global_state.w_gaze = W_GAZE
     global_state.w_voice = W_VOICE
     global_state.w_face = W_FACE
+
+
+# ── ML Fusion Model Loading (Optional) ──────────────────────────────────────
+_ml_model = None
+_ml_feature_cols = None
+
+def load_ml_fusion_model():
+    """Load the trained fusion model if available."""
+    global _ml_model, _ml_feature_cols
+    
+    if _ml_model is not None:
+        return _ml_model, _ml_feature_cols
+    
+    model_path = os.path.join(os.path.dirname(__file__), "fusion_model.pkl")
+    
+    if not os.path.exists(model_path):
+        return None, None
+    
+    try:
+        with open(model_path, "rb") as f:
+            payload = pickle.load(f)
+        _ml_model = payload["model"]
+        _ml_feature_cols = payload["feature_cols"]
+        print(f"[ML Fusion] Loaded model from {model_path}")
+        return _ml_model, _ml_feature_cols
+    except Exception as e:
+        print(f"[ML Fusion] Error loading model: {e}")
+        return None, None
+
+
+def ml_fusion_predict(gaze_score, face_score, voice_score, micro_var,
+                      jitter, shimmer, spectral_centroid, anomaly_duration,
+                      object_flag) -> float:
+    """
+    Get integrity score from trained ML model.
+    Returns probability of legitimate * 100 (so high = good).
+    Uses 9 features (no final_integrity_score to prevent leakage).
+    """
+    model, feature_cols = load_ml_fusion_model()
+    
+    if model is None:
+        return None  # Fallback signal
+    
+    # Build feature vector in correct order (9 features, no leakage)
+    feature_map = {
+        "gaze_score": gaze_score,
+        "face_score": face_score,
+        "voice_score": voice_score,
+        "micro_var": micro_var,
+        "jitter": jitter,
+        "shimmer": shimmer,
+        "spectral_centroid": spectral_centroid,
+        "anomaly_duration": anomaly_duration,
+        "object_flag": int(object_flag),
+    }
+    
+    try:
+        X = [[feature_map.get(col, 0.0) for col in feature_cols]]
+        # predict_proba returns [P(suspicious), P(legitimate)] for class [0, 1]
+        # We want P(legitimate) which is class 0
+        proba = model.predict_proba(X)[0]
+        # Class 0 = legitimate, so return P(legitimate) * 100
+        return proba[0] * 100.0
+    except Exception as e:
+        print(f"[ML Fusion] Prediction error: {e}")
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -253,10 +343,11 @@ def adaptive_harmonic_fusion(gaze_score, voice_score, face_score, anomaly_time,
     Returns:
         int: fused integrity score 0-100
     """
-    # 1. Normalize inputs to 0.01 - 1.0 (Avoid division by zero)
-    g = max(1.0, gaze_score) / 100.0
-    v = max(1.0, voice_score) / 100.0
-    f = max(1.0, face_score) / 100.0
+    # 1. Normalize inputs with ε = 0.15 floor (prevents instability)
+    # Per whitepaper: g(t) = max(ε, G(t)) / 100 where ε = 15
+    g = max(15.0, gaze_score) / 100.0
+    v = max(15.0, voice_score) / 100.0
+    f = max(15.0, face_score) / 100.0
     
     # 2. Dynamic Weights (Reliability-Based)
     # If a sensor is very low, we trust it MORE (Zero-Trust Principle)
@@ -276,11 +367,9 @@ def adaptive_harmonic_fusion(gaze_score, voice_score, face_score, anomaly_time,
     # Penalty grows with time: 1s=1.0, 3s=0.55, 5s=0.25, 7s=0.0
     decay_factor = max(0.0, 1.0 - (0.15 * anomaly_time))
     
+    # 5. Final Adaptive Harmonic Fusion: I(t) = 100 · H(t) · D(t)
     final_score = harmonic_mean * decay_factor * 100.0
     return int(max(0, min(100, final_score)))
-    arr = np.array(history)            # shape (T, N, 2)
-    var = np.var(arr, axis=0).mean()   # average variance across landmarks & axes
-    return float(var)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -463,11 +552,19 @@ class BiometricAnalyzer(VideoProcessorBase):
         # Calibration
         self.calibration_frames = 0
         self.base_vert_ratio = 0.5
+        
+        # Frame timing for accurate anomaly duration (not FPS-dependent)
+        self._last_frame_time = time.time()
 
     # ══════════════════════════════════════════════════════════════════════
     #  recv — runs every frame (~30 Hz)
     # ══════════════════════════════════════════════════════════════════════
     def recv(self, frame):
+        # Calculate real time delta between frames
+        now = time.time()
+        dt = now - self._last_frame_time
+        self._last_frame_time = now
+        
         img = frame.to_ndarray(format="bgr24")
         h, w, _ = img.shape
         img = cv2.flip(img, 1)
@@ -644,21 +741,44 @@ class BiometricAnalyzer(VideoProcessorBase):
         
         with global_state.lock:
             if is_anomaly:
-                # Increase timer (assuming ~30 FPS, add ~0.033s per frame)
-                global_state.anomaly_duration += 0.033
+                # Increase timer using real time delta (frame-rate independent)
+                global_state.anomaly_duration += dt
             else:
-                # Recovery (cool down slowly)
-                global_state.anomaly_duration = max(0.0, global_state.anomaly_duration - 0.1)
+                # Recovery (cool down at 3x rate of accumulation)
+                global_state.anomaly_duration = max(0.0, global_state.anomaly_duration - (dt * 3))
             anomaly_time = global_state.anomaly_duration
         
         # Choose fusion method based on thread-safe state
         with global_state.lock:
             use_harmonic = global_state.use_harmonic
+            use_ml_fusion = global_state.use_ml_fusion
             w_gaze = global_state.w_gaze
             w_voice = global_state.w_voice
             w_face = global_state.w_face
+            spectral_centroid = global_state.spectral_centroid
         
-        if use_harmonic:
+        # ML Fusion (if enabled and model available)
+        if use_ml_fusion:
+            ml_score = ml_fusion_predict(
+                gaze_score=self.gaze_score,
+                face_score=self.face_score,
+                voice_score=voice_score,
+                micro_var=self.micro_var,
+                jitter=jitter_val,
+                shimmer=shimmer_val,
+                spectral_centroid=spectral_centroid,
+                anomaly_duration=anomaly_time,
+                object_flag=suspicious_object_found,
+            )
+            if ml_score is not None:
+                fused = ml_score
+            else:
+                # Fallback to harmonic if ML fails
+                fused = adaptive_harmonic_fusion(
+                    self.gaze_score, voice_score, self.face_score,
+                    anomaly_time, w_gaze, w_voice, w_face
+                )
+        elif use_harmonic:
             # Adaptive Harmonic Fusion (strict, zero-trust)
             fused = adaptive_harmonic_fusion(
                 self.gaze_score, voice_score, self.face_score,
@@ -689,6 +809,7 @@ class BiometricAnalyzer(VideoProcessorBase):
             global_state.integrity_score = self.integrity_score
             global_state.gaze_score = self.gaze_score
             global_state.face_score = self.face_score
+            global_state.micro_var = self.micro_var  # For feature logging
             if self.frame_count % 15 == 0:  # ~2 Hz sample rate for graph
                 elapsed = time.time() - global_state.session_start
                 global_state.score_history.append(self.integrity_score)
@@ -1045,6 +1166,18 @@ with b3:
     st.caption(f"w_g={W_GAZE}  w_v={W_VOICE}  w_f={W_FACE}")
 
 # ── Live update loop — polls global_state every second ───────────────────
+
+# Initialize feature logger if enabled (session-scoped)
+if "feature_logger" not in st.session_state:
+    st.session_state.feature_logger = None
+
+if ENABLE_LOGGING and st.session_state.feature_logger is None:
+    st.session_state.feature_logger = FeatureLogger()
+    st.sidebar.success(f"💾 Logging to: {st.session_state.feature_logger.csv_path}")
+elif not ENABLE_LOGGING and st.session_state.feature_logger is not None:
+    st.session_state.feature_logger.close()
+    st.session_state.feature_logger = None
+
 _frame_counter = 0
 while True:
     with global_state.lock:
@@ -1066,6 +1199,11 @@ while True:
         _times     = list(global_state.time_history)
         _scores    = list(global_state.score_history)
 
+    # Dataset logging (modular, non-blocking)
+    if st.session_state.feature_logger is not None:
+        features = extract_features_from_state(global_state)
+        st.session_state.feature_logger.log_features(features, LOGGING_LABEL_INT)
+
     draw_dashboard(
         score=_score,
         status=_status,
@@ -1084,3 +1222,4 @@ while True:
 
     _frame_counter += 1
     time.sleep(1)
+cd backend && python3 train_model.pycd backend && python3 train_model.py

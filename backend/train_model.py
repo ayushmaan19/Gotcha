@@ -1,227 +1,527 @@
 """
-SDP-1: Integrity Model Trainer (Hybrid Edition)
-===============================================
-Trains a RandomForestClassifier by FUSING:
-1. Real Data (Your Face) - for personalization
-2. Synthetic Data (General Rules) - for robustness
-
-Expected CSV schema:
-  yaw       : float  - Head yaw angle in degrees (0 = centre)
-  ear       : float  - Eye Aspect Ratio (approx 0.25 open, <0.20 blink)
-  volume    : float  - RMS audio energy (0.0-1.0)
-  label     : int    - 0 = legitimate, 1 = suspicious
+SDP-1: Integrity Model Trainer (Research Edition)
+=================================================
+Refactored for research evaluation with:
+- Structured functions
+- 80/20 split + 5-fold cross validation
+- Full metrics suite (Accuracy, Precision, Recall, F1, ROC-AUC)
+- Confusion matrix, ROC curve, Feature importance plots
+- Ablation study mode
 
 Usage:
-  python train_model.py                         # synthetic only (baseline)
-  python train_model.py --csv my_face_data.csv  # HYBRID: real + synthetic
+  python train_model.py                         # Train with default/synthetic data
+  python train_model.py --csv my_face_data.csv  # Train with real data
+  python train_model.py --ablation              # Run ablation study
 
-  The trained model is saved as integrity_model.pkl
+Expected CSV schema from dataset_logs/:
+  gaze_score, face_score, voice_score, micro_var, jitter, shimmer,
+  spectral_centroid, anomaly_duration, object_flag, final_integrity_score, label
 """
 
 import argparse
 import os
 import sys
 import pickle
+import glob
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.metrics import (
+    classification_report, confusion_matrix, accuracy_score,
+    precision_score, recall_score, f1_score, roc_auc_score, roc_curve
+)
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for server
+import matplotlib.pyplot as plt
 
 
-# ── Defaults ─────────────────────────────────────────────────────────────────
-DEFAULT_CSV = "data.csv"
-MODEL_OUT   = "integrity_model.pkl"
+# ── Configuration ────────────────────────────────────────────────────────────
+MODEL_OUT = "fusion_model.pkl"
+DATASET_DIR = "dataset_logs"
+RANDOM_STATE = 42
 
-# Feature engineering thresholds (mirror app.py logic)
-YAW_THRESH    = 20.0   # degrees — looking-away boundary
-EAR_THRESH    = 0.20   # blink / eye-closure boundary
-VOL_HIGH      = 0.60   # "shouting" energy boundary
-VOL_LOW       = 0.01   # "muted / silent" energy boundary
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STEP 1: LOAD DATASET
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_dataset(csv_path: str = None, merge_logs: bool = True) -> pd.DataFrame:
+    """
+    Load dataset from CSV file(s).
+    
+    Args:
+        csv_path: Path to specific CSV file (optional)
+        merge_logs: If True, merge all CSVs from dataset_logs/ directory
+    
+    Returns:
+        pd.DataFrame with features and labels
+    """
+    dfs = []
+    
+    # Load specific CSV if provided
+    if csv_path and os.path.isfile(csv_path):
+        print(f"[*] Loading dataset from: {csv_path}")
+        df = pd.read_csv(csv_path)
+        dfs.append(df)
+    
+    # Merge all logs from dataset_logs/ if enabled
+    if merge_logs and os.path.isdir(DATASET_DIR):
+        log_files = glob.glob(os.path.join(DATASET_DIR, "session_*.csv"))
+        print(f"[*] Found {len(log_files)} session logs in {DATASET_DIR}/")
+        for f in log_files:
+            try:
+                df = pd.read_csv(f)
+                if len(df) > 0:
+                    dfs.append(df)
+                    print(f"    → Loaded {len(df)} samples from {os.path.basename(f)}")
+            except Exception as e:
+                print(f"    [!] Error loading {f}: {e}")
+    
+    if not dfs:
+        print("[!] No datasets found. Generating synthetic data...")
+        return generate_synthetic_dataset()
+    
+    # Merge all dataframes
+    merged = pd.concat(dfs, ignore_index=True)
+    
+    # Clean up: drop rows with missing labels
+    if 'label' in merged.columns:
+        merged = merged.dropna(subset=['label'])
+        merged['label'] = merged['label'].astype(int)
+    
+    print(f"[*] Total dataset size: {len(merged)} samples")
+    print(f"    Class distribution:\n{merged['label'].value_counts().to_string()}\n")
+    
+    return merged
 
 
 def generate_synthetic_dataset(n_samples: int = 2000, seed: int = 42) -> pd.DataFrame:
     """
-    Generate a balanced synthetic dataset when no real CSV is available.
-    This lets you train a baseline model immediately.
-    
-    Class 0 — Legitimate (centred gaze, normal blink, moderate voice)
-    Class 1 — Suspicious  (off-axis gaze, abnormal blink, stressed voice)
+    Generate synthetic dataset matching the feature_logger schema.
+    Used when no real data is available.
     """
     rng = np.random.RandomState(seed)
     half = n_samples // 2
-
-    # ── Legitimate samples ───────────────────────────────────────────────
-    yaw_legit  = rng.normal(0.0, 5.0, half)          # mostly centred
-    ear_legit  = rng.normal(0.28, 0.03, half)         # natural blink range
-    vol_legit  = rng.normal(0.25, 0.08, half)         # calm speaking
-    labels_legit = np.zeros(half, dtype=int)
-
-    # ── Suspicious samples ───────────────────────────────────────────────
-    yaw_sus  = rng.normal(35.0, 12.0, half)           # looking off to the side
-    yaw_sus  = np.abs(yaw_sus)                        # always positive deviation
-    ear_sus  = rng.normal(0.15, 0.05, half)           # squinting / forced
-    # Half muted, half shouting
-    vol_quiet = rng.normal(0.02, 0.01, half // 2)
-    vol_loud  = rng.normal(0.75, 0.10, half - half // 2)
-    vol_sus   = np.concatenate([vol_quiet, vol_loud])
-    rng.shuffle(vol_sus)
-    labels_sus = np.ones(half, dtype=int)
-
-    df = pd.DataFrame({
-        "yaw":    np.concatenate([yaw_legit, yaw_sus]),
-        "ear":    np.concatenate([ear_legit, ear_sus]).clip(0.0, 0.5),
-        "volume": np.concatenate([vol_legit, vol_sus]).clip(0.0, 1.0),
-        "label":  np.concatenate([labels_legit, labels_sus]),
+    
+    # Legitimate samples (good engagement, low stress)
+    legit = pd.DataFrame({
+        "gaze_score": rng.normal(85, 10, half).clip(0, 100),
+        "face_score": rng.normal(90, 8, half).clip(0, 100),
+        "voice_score": rng.normal(88, 12, half).clip(0, 100),
+        "micro_var": rng.exponential(0.5, half).clip(0.1, 5.0),
+        "jitter": rng.normal(1.5, 0.8, half).clip(0, 5),
+        "shimmer": rng.normal(4.0, 2.0, half).clip(0, 10),
+        "spectral_centroid": rng.normal(1500, 400, half).clip(500, 4000),
+        "anomaly_duration": rng.exponential(0.5, half).clip(0, 3),
+        "object_flag": rng.binomial(1, 0.05, half),  # 5% false alarms
+        "final_integrity_score": rng.normal(80, 15, half).clip(0, 100),
+        "label": np.zeros(half, dtype=int),
     })
-    return df.sample(frac=1, random_state=seed).reset_index(drop=True)
-
-
-def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Derive higher-order features that match the fusion logic in app.py.
-    These give the tree-based model better decision boundaries.
-    """
-    df = df.copy()
-    df["yaw_abs"]       = df["yaw"].abs()
-    df["looking_away"]  = (df["yaw_abs"] > YAW_THRESH).astype(int)
-    df["blink_risk"]    = (df["ear"] < EAR_THRESH).astype(int)
-    df["vol_silent"]    = (df["volume"] < VOL_LOW).astype(int)
-    df["vol_shout"]     = (df["volume"] > VOL_HIGH).astype(int)
-
-    # Interaction features (cross-modal cues)
-    df["away_and_quiet"]  = df["looking_away"] * df["vol_silent"]
-    df["away_and_loud"]   = df["looking_away"] * df["vol_shout"]
-
-    # Basic sub-scores (simplified version of app.py fusion)
-    df["gaze_score"]  = 100.0 - df["yaw_abs"].clip(0, 50) * 2.0
-    df["face_score"]  = np.where(df["ear"] < 0.10, 0.0, 100.0)
-    df["voice_score"] = 100.0 - np.where(
-        df["vol_silent"] | df["vol_shout"], 30.0, 0.0
-    )
-    df["fusion_score"] = (
-        0.4 * df["gaze_score"]
-        + 0.3 * df["voice_score"]
-        + 0.3 * df["face_score"]
-    )
+    
+    # Suspicious samples (distracted, stressed, cheating)
+    suspicious = pd.DataFrame({
+        "gaze_score": rng.normal(35, 20, half).clip(0, 100),
+        "face_score": rng.normal(50, 25, half).clip(0, 100),
+        "voice_score": rng.normal(55, 25, half).clip(0, 100),
+        "micro_var": rng.exponential(0.1, half).clip(0, 0.3),  # Frozen face
+        "jitter": rng.normal(5.0, 2.0, half).clip(0, 15),
+        "shimmer": rng.normal(12.0, 4.0, half).clip(0, 25),
+        "spectral_centroid": rng.normal(2500, 800, half).clip(500, 5000),
+        "anomaly_duration": rng.exponential(3.0, half).clip(0, 10),
+        "object_flag": rng.binomial(1, 0.35, half),  # 35% device detected
+        "final_integrity_score": rng.normal(35, 20, half).clip(0, 100),
+        "label": np.ones(half, dtype=int),
+    })
+    
+    df = pd.concat([legit, suspicious], ignore_index=True)
+    df = df.sample(frac=1, random_state=seed).reset_index(drop=True)
+    
+    # Save for inspection
+    df.to_csv("synthetic_data.csv", index=False)
+    print("[*] Generated synthetic dataset saved to synthetic_data.csv")
+    
     return df
 
 
-def train(csv_path: str | None = None):
-    """Load data, engineer features, train model, evaluate, and save."""
-
-    # ── 1. Load Real Data (if available) ────────────────────────────────
-    real_df = pd.DataFrame()
-    if csv_path and os.path.isfile(csv_path):
-        print(f"[*] Loading REAL dataset from: {csv_path}")
-        real_df = pd.read_csv(csv_path)
-        required = {"yaw", "ear", "volume", "label"}
-        missing = required - set(real_df.columns)
-        if missing:
-            print(f"[!] CSV is missing columns: {missing}")
-            sys.exit(1)
-        print(f"    → Loaded {len(real_df)} real samples.")
-    else:
-        if csv_path:
-            print(f"[!] Warning: No real file found at '{csv_path}'. Using synthetic only.")
-
-    # ── 2. Generate Synthetic Data (General Knowledge) ──────────────────
-    # 1000 samples to stabilize the model without drowning real data
-    print("[*] Generating synthetic dataset (1,000 samples) for robustness...")
-    synth_df = generate_synthetic_dataset(n_samples=1000)
-
-    # ── 3. Merge Them (The Hybrid Strategy) ─────────────────────────────
-    if not real_df.empty:
-        print("[*] MERGING Real + Synthetic Data...")
-        df = pd.concat([real_df, synth_df], ignore_index=True)
-    else:
-        df = synth_df
-        # Save synthetic so user can inspect it
-        df.to_csv("data.csv", index=False)
-        print("    → Saved synthetic data to data.csv")
-
-    print(f"[*] Total Dataset shape: {df.shape}")
-    print(f"    Class distribution:\n{df['label'].value_counts().to_string()}\n")
-
-    # ── 2. Feature engineering ───────────────────────────────────────────
-    df = add_engineered_features(df)
-
-    feature_cols = [
-        "yaw_abs", "ear", "volume",
-        "looking_away", "blink_risk",
-        "vol_silent", "vol_shout",
-        "away_and_quiet", "away_and_loud",
-        "gaze_score", "face_score", "voice_score", "fusion_score",
+def get_feature_columns() -> list:
+    """Return the feature columns used for training (9 features, no leakage)."""
+    return [
+        "gaze_score",
+        "face_score",
+        "voice_score",
+        "micro_var",
+        "jitter",
+        "shimmer",
+        "spectral_centroid",
+        "anomaly_duration",
+        "object_flag",
     ]
-    X = df[feature_cols].values
-    y = df["label"].values.astype(int)
 
-    # ── 3. Split ─────────────────────────────────────────────────────────
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.20, random_state=42, stratify=y
-    )
-    print(f"[*] Train: {len(X_train)}  |  Test: {len(X_test)}")
 
-    # ── 4. Train Random Forest ───────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  STEP 2: TRAIN RANDOM FOREST
+# ══════════════════════════════════════════════════════════════════════════════
+
+def train_random_forest(X_train: np.ndarray, y_train: np.ndarray,
+                        n_estimators: int = 200,
+                        max_depth: int = 12) -> RandomForestClassifier:
+    """
+    Train a RandomForestClassifier.
+    
+    Args:
+        X_train: Training features
+        y_train: Training labels
+        n_estimators: Number of trees
+        max_depth: Maximum tree depth
+    
+    Returns:
+        Trained RandomForestClassifier
+    """
+    print(f"[*] Training RandomForest (n_estimators={n_estimators}, max_depth={max_depth})...")
+    
     clf = RandomForestClassifier(
-        n_estimators=200,
-        max_depth=12,
+        n_estimators=n_estimators,
+        max_depth=max_depth,
         min_samples_leaf=5,
         class_weight="balanced",
-        random_state=42,
+        random_state=RANDOM_STATE,
         n_jobs=-1,
     )
+    
     clf.fit(X_train, y_train)
+    print(f"    → Training complete. {len(y_train)} samples used.")
+    
+    return clf
 
-    # ── 5. Evaluate ──────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STEP 3: EVALUATE MODEL
+# ══════════════════════════════════════════════════════════════════════════════
+
+def evaluate_model(clf: RandomForestClassifier,
+                   X_train: np.ndarray, y_train: np.ndarray,
+                   X_test: np.ndarray, y_test: np.ndarray,
+                   feature_cols: list,
+                   save_plots: bool = True) -> dict:
+    """
+    Comprehensive model evaluation with metrics and plots.
+    
+    Args:
+        clf: Trained classifier
+        X_train, y_train: Training data (for cross-validation)
+        X_test, y_test: Test data
+        feature_cols: Feature column names
+        save_plots: Whether to save evaluation plots
+    
+    Returns:
+        dict: All computed metrics
+    """
+    print("\n" + "="*60)
+    print("MODEL EVALUATION")
+    print("="*60)
+    
+    # Predictions
     y_pred = clf.predict(X_test)
-    print("\n── Classification Report ──")
-    print(classification_report(y_test, y_pred, target_names=["Legitimate", "Suspicious"]))
-    print("── Confusion Matrix ──")
-    print(confusion_matrix(y_test, y_pred))
+    y_proba = clf.predict_proba(X_test)[:, 1]
+    
+    # Core metrics
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred, zero_division=0)
+    recall = recall_score(y_test, y_pred, zero_division=0)
+    f1 = f1_score(y_test, y_pred, zero_division=0)
+    
+    try:
+        roc_auc = roc_auc_score(y_test, y_proba)
+    except ValueError:
+        roc_auc = 0.5  # Undefined if only one class present
+    
+    print(f"\n── Test Set Metrics ──")
+    print(f"  Accuracy:  {accuracy:.4f}")
+    print(f"  Precision: {precision:.4f}")
+    print(f"  Recall:    {recall:.4f}")
+    print(f"  F1-Score:  {f1:.4f}")
+    print(f"  ROC-AUC:   {roc_auc:.4f}")
+    
+    # Classification report
+    print(f"\n── Classification Report ──")
+    print(classification_report(y_test, y_pred, 
+                                 target_names=["Legitimate", "Suspicious"],
+                                 zero_division=0))
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    print(f"── Confusion Matrix ──")
+    print(cm)
+    
+    # 5-Fold Cross Validation
+    print(f"\n── 5-Fold Cross Validation ──")
+    X_full = np.vstack([X_train, X_test])
+    y_full = np.concatenate([y_train, y_test])
+    
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    cv_accuracy = cross_val_score(clf, X_full, y_full, cv=cv, scoring="accuracy")
+    cv_f1 = cross_val_score(clf, X_full, y_full, cv=cv, scoring="f1")
+    cv_roc_auc = cross_val_score(clf, X_full, y_full, cv=cv, scoring="roc_auc")
+    
+    print(f"  CV Accuracy: {cv_accuracy.mean():.4f} ± {cv_accuracy.std():.4f}")
+    print(f"  CV F1-Score: {cv_f1.mean():.4f} ± {cv_f1.std():.4f}")
+    print(f"  CV ROC-AUC:  {cv_roc_auc.mean():.4f} ± {cv_roc_auc.std():.4f}")
+    
+    # Feature importance
+    print(f"\n── Feature Importances ──")
+    importances = clf.feature_importances_
+    sorted_idx = np.argsort(importances)[::-1]
+    for i in sorted_idx:
+        print(f"  {feature_cols[i]:<25s} {importances[i]:.4f}")
+    
+    # Save plots
+    if save_plots:
+        _save_evaluation_plots(cm, y_test, y_proba, feature_cols, importances)
+    
+    return {
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "roc_auc": roc_auc,
+        "cv_accuracy_mean": cv_accuracy.mean(),
+        "cv_f1_mean": cv_f1.mean(),
+        "cv_roc_auc_mean": cv_roc_auc.mean(),
+    }
 
-    # Cross-validation
-    cv_scores = cross_val_score(clf, X, y, cv=5, scoring="f1_weighted")
-    print(f"\n[*] 5-Fold CV F1 (weighted): {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
 
-    # Feature importances
-    print("\n── Feature Importances ──")
-    for name, imp in sorted(zip(feature_cols, clf.feature_importances_), key=lambda x: -x[1]):
-        print(f"    {name:<20s} {imp:.4f}")
+def _save_evaluation_plots(cm: np.ndarray, y_test: np.ndarray, y_proba: np.ndarray,
+                            feature_cols: list, importances: np.ndarray):
+    """Save confusion matrix, ROC curve, and feature importance plots."""
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # 1. Confusion Matrix Plot
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(cm, cmap='Blues')
+    ax.set_xticks([0, 1])
+    ax.set_yticks([0, 1])
+    ax.set_xticklabels(['Legitimate', 'Suspicious'])
+    ax.set_yticklabels(['Legitimate', 'Suspicious'])
+    ax.set_xlabel('Predicted')
+    ax.set_ylabel('Actual')
+    ax.set_title('Confusion Matrix')
+    
+    # Add text annotations
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, str(cm[i, j]), ha='center', va='center', 
+                   color='white' if cm[i, j] > cm.max()/2 else 'black', fontsize=16)
+    
+    plt.colorbar(im)
+    plt.tight_layout()
+    plt.savefig(f"confusion_matrix_{timestamp}.png", dpi=150)
+    plt.close()
+    print(f"\n[*] Saved: confusion_matrix_{timestamp}.png")
+    
+    # 2. ROC Curve Plot
+    try:
+        fpr, tpr, _ = roc_curve(y_test, y_proba)
+        roc_auc = roc_auc_score(y_test, y_proba)
+        
+        fig, ax = plt.subplots(figsize=(6, 5))
+        ax.plot(fpr, tpr, 'b-', linewidth=2, label=f'ROC (AUC = {roc_auc:.3f})')
+        ax.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Random')
+        ax.set_xlim([0, 1])
+        ax.set_ylim([0, 1.05])
+        ax.set_xlabel('False Positive Rate')
+        ax.set_ylabel('True Positive Rate')
+        ax.set_title('ROC Curve')
+        ax.legend(loc='lower right')
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f"roc_curve_{timestamp}.png", dpi=150)
+        plt.close()
+        print(f"[*] Saved: roc_curve_{timestamp}.png")
+    except Exception as e:
+        print(f"[!] Could not generate ROC curve: {e}")
+    
+    # 3. Feature Importance Plot
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sorted_idx = np.argsort(importances)
+    ax.barh(range(len(importances)), importances[sorted_idx], color='steelblue')
+    ax.set_yticks(range(len(importances)))
+    ax.set_yticklabels([feature_cols[i] for i in sorted_idx])
+    ax.set_xlabel('Importance')
+    ax.set_title('Feature Importances (Random Forest)')
+    plt.tight_layout()
+    plt.savefig(f"feature_importance_{timestamp}.png", dpi=150)
+    plt.close()
+    print(f"[*] Saved: feature_importance_{timestamp}.png")
 
-    # ── 6. Save ──────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STEP 4: ABLATION STUDY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_ablation_study(df: pd.DataFrame):
+    """
+    Run ablation study by training models with different feature subsets.
+    
+    Configurations:
+    - All features
+    - Without gaze features
+    - Without audio features
+    - Without face features
+    """
+    print("\n" + "="*70)
+    print("ABLATION STUDY")
+    print("="*70)
+    
+    all_features = get_feature_columns()
+    
+    # Define ablation configurations
+    configs = {
+        "All Features": all_features,
+        "Without Gaze": [f for f in all_features if f not in ["gaze_score"]],
+        "Without Audio": [f for f in all_features if f not in ["voice_score", "jitter", "shimmer", "spectral_centroid"]],
+        "Without Face": [f for f in all_features if f not in ["face_score", "micro_var"]],
+        "Without Object": [f for f in all_features if f not in ["object_flag"]],
+        "Gaze Only": ["gaze_score", "anomaly_duration"],
+        "Audio Only": ["voice_score", "jitter", "shimmer", "spectral_centroid"],
+        "Face Only": ["face_score", "micro_var"],
+    }
+    
+    results = []
+    
+    for config_name, features in configs.items():
+        print(f"\n[*] Configuration: {config_name}")
+        print(f"    Features: {features}")
+        
+        # Check all features exist
+        missing = [f for f in features if f not in df.columns]
+        if missing:
+            print(f"    [!] Skipping - missing columns: {missing}")
+            continue
+        
+        X = df[features].values
+        y = df["label"].values.astype(int)
+        
+        # 80/20 split
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.20, random_state=RANDOM_STATE, stratify=y
+        )
+        
+        # Train
+        clf = train_random_forest(X_train, y_train)
+        
+        # Evaluate (without plots for ablation)
+        y_pred = clf.predict(X_test)
+        y_proba = clf.predict_proba(X_test)[:, 1]
+        
+        accuracy = accuracy_score(y_test, y_pred)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
+        try:
+            roc_auc = roc_auc_score(y_test, y_proba)
+        except ValueError:
+            roc_auc = 0.5
+        
+        results.append({
+            "Configuration": config_name,
+            "Accuracy": accuracy,
+            "F1": f1,
+            "ROC-AUC": roc_auc,
+            "Features": len(features),
+        })
+        
+        print(f"    Accuracy: {accuracy:.4f} | F1: {f1:.4f} | ROC-AUC: {roc_auc:.4f}")
+    
+    # Print comparison table
+    print("\n" + "="*70)
+    print("ABLATION RESULTS SUMMARY")
+    print("="*70)
+    print(f"{'Configuration':<20s} | {'Accuracy':>10s} | {'F1':>10s} | {'ROC-AUC':>10s} | {'#Feat':>6s}")
+    print("-"*70)
+    for r in results:
+        print(f"{r['Configuration']:<20s} | {r['Accuracy']:>10.4f} | {r['F1']:>10.4f} | {r['ROC-AUC']:>10.4f} | {r['Features']:>6d}")
+    print("="*70)
+    
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main(csv_path: str = None, ablation: bool = False):
+    """Main training pipeline."""
+    
+    print("[INFO] Training without final_integrity_score to prevent leakage.")
+    
+    # Load data
+    df = load_dataset(csv_path=csv_path)
+    
+    if len(df) < 20:
+        print("[!] Insufficient data. Need at least 20 samples.")
+        sys.exit(1)
+    
+    # Ablation study mode
+    if ablation:
+        run_ablation_study(df)
+        return
+    
+    # Standard training
+    feature_cols = get_feature_columns()
+    
+    # Check all features exist
+    missing = [f for f in feature_cols if f not in df.columns]
+    if missing:
+        print(f"[!] Missing columns in dataset: {missing}")
+        print(f"    Available: {list(df.columns)}")
+        sys.exit(1)
+    
+    X = df[feature_cols].values
+    y = df["label"].values.astype(int)
+    
+    # 80/20 split
+    print(f"\n[*] Splitting data: 80% train / 20% test")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.20, random_state=RANDOM_STATE, stratify=y
+    )
+    print(f"    Train: {len(X_train)} | Test: {len(X_test)}")
+    
+    # Train
+    clf = train_random_forest(X_train, y_train)
+    
+    # Evaluate
+    metrics = evaluate_model(clf, X_train, y_train, X_test, y_test, feature_cols)
+    
+    # Save model
     payload = {
         "model": clf,
         "feature_cols": feature_cols,
-        "thresholds": {
-            "yaw": YAW_THRESH,
-            "ear": EAR_THRESH,
-            "vol_high": VOL_HIGH,
-            "vol_low": VOL_LOW,
-        },
+        "metrics": metrics,
+        "timestamp": datetime.now().isoformat(),
     }
+    
     with open(MODEL_OUT, "wb") as f:
         pickle.dump(payload, f)
-
-    # Count real vs synthetic samples used
-    real_count = len(real_df) if not real_df.empty else 0
-    synth_count = len(synth_df)
     
-    print(f"\n[✓] HYBRID Model saved to {MODEL_OUT}")
-    print(f"    Using {real_count} real samples + {synth_count} synthetic samples.")
+    print(f"\n[✓] Model saved to: {MODEL_OUT}")
     print(f"    Features: {feature_cols}")
-    print(f"    To load:  pickle.load(open('{MODEL_OUT}', 'rb'))")
+    print(f"    To load: pickle.load(open('{MODEL_OUT}', 'rb'))")
 
 
-# ── CLI ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train the Hybrid Integrity classifier"
+        description="SDP-1 Integrity Model Trainer (Research Edition)"
     )
     parser.add_argument(
-        "--csv", type=str, default=DEFAULT_CSV,
-        help="Path to CSV with columns [yaw, ear, volume, label]"
+        "--csv", type=str, default=None,
+        help="Path to CSV dataset file"
+    )
+    parser.add_argument(
+        "--ablation", action="store_true",
+        help="Run ablation study with different feature subsets"
     )
     args = parser.parse_args()
-    train(csv_path=args.csv)
+    
+    main(csv_path=args.csv, ablation=args.ablation)

@@ -10,7 +10,7 @@
 	<img src="https://img.shields.io/badge/Streamlit-Realtime-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white" />
 	<img src="https://img.shields.io/badge/Model-RandomForest-2E7D32?style=for-the-badge" />
 	<img src="https://img.shields.io/badge/Inference-CPU%20Optimized-1565C0?style=for-the-badge" />
-	<img src="https://img.shields.io/badge/Status-Submission%20Ready-6A1B9A?style=for-the-badge" />
+	<!-- <img src="https://img.shields.io/badge/Status-Submission%20Ready-6A1B9A?style=for-the-badge" /> -->
 </p>
 
 ---

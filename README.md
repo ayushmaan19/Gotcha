@@ -1,116 +1,147 @@
 # Real-Time Multimodal Biometric Integrity Analysis (RMBIA)
-### A "Zero-Trust" Behavioral Security Framework for Remote Communication
 
-![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
-![Streamlit](https://img.shields.io/badge/Framework-Streamlit-red)
-![Computer Vision](https://img.shields.io/badge/Library-MediaPipe%20%7C%20OpenCV-green)
-![Status](https://img.shields.io/badge/Status-Prototype%20(MVP)-orange)
+A lightweight, CPU-first multimodal integrity scoring system for remote communication.
+The project combines face, gaze, audio, and context features in real time and uses a trained fusion model for suspicious-behavior detection.
 
----
+## Overview
 
-## 📌 1. Project Abstract
-**RMBIA** is a real-time security framework designed to detect **Social Engineering** and **Identity Impersonation** attacks in video conferencing. Unlike traditional authentication that verifies identity only at login (Entry-Point Security), this system employs **Continuous Behavioral Authentication**.
+RMBIA is designed for continuous behavioral verification during a video session.
+Instead of one-time login authentication, it continuously tracks behavioral and physiological signals to estimate an integrity/risk score.
 
-By fusing **Ocular Kinematics** (Gaze Tracking), **Facial Geometry** (Liveness Detection), and **Vocal Prosody** (Stress Analysis), the system calculates a dynamic **Integrity Score** to flag suspicious behavior—such as coerced speech, script reading, or deepfake usage—in real-time. This effectively creates a "Zero-Trust" security layer inside the video call session.
+Primary use case: detecting social engineering indicators such as coached responses, abnormal gaze patterns, liveness inconsistency, and audio stress anomalies.
 
----
+## What Is Implemented
 
-## 🚀 2. Key Features & Modules
+- Real-time Streamlit + WebRTC pipeline.
+- Face-based features (liveness variance and expression stability).
+- Gaze/blink features (attention drift, blink behavior).
+- Audio forensics features (jitter, shimmer proxies, spectral descriptors).
+- Optional object-context signal via EfficientDet Lite0.
+- ML fusion with RandomForest and a live dashboard score.
+- Dataset logger for supervised model training.
+- Training and ablation pipeline with plots and reports.
+- Synthetic dataset generator for rapid scale-up experiments.
 
-### A. Visual Liveness & Integrity (Face Module)
-- **Technology:** Google MediaPipe Face Mesh (468 Landmarks).
-- **Function:** Detects 3D facial geometry to distinguish between live humans and 2D spoofing attacks.
-- **Micro-Expression Analysis:** Monitors facial variance to detect "frozen" deepfake expressions or unnatural emotional consistency.
+## Latest Updates (March 2026)
 
-### B. Ocular Attention Monitoring (Gaze Module)
-- **Technology:** OpenCV & Eye Aspect Ratio (EAR).
-- **Function:** Tracks eye gaze vectors and blink rates.
-- **Social Engineering Detection:** Flags **Gaze Aversion** (looking off-screen constantly), which is a high-confidence indicator of reading a script or forced coaching (Cognitive Load).
+- Fixed audio mono conversion robustness in the real-time stream path to handle channel layout differences.
+- Restored object detection flag propagation into logged features for true multimodal capture.
+- Updated ablation pipeline for fair multimodal vs single-modality comparison.
+- Added Balanced Accuracy to handle class imbalance more honestly.
+- Fixed training behavior so custom CSV runs do not auto-merge session logs unintentionally.
+- Added synthetic benchmark generation script for 10k-60k controlled experiments.
+- Expanded ignore rules to keep generated artifacts and binaries out of normal source commits.
 
-### C. Audio Forensics (Voice Module) *[Planned]*
-- **Technology:** Librosa (Spectral Analysis).
-- **Function:** Extracts **Jitter** (Pitch Instability) and **Shimmer** (Loudness Instability) to detect stress biomarkers often present in coerced victims or synthetic voice artifacts.
+## Verified Results Snapshot
 
----
+### Real logged-session dataset (732 rows)
 
-## 🧠 3. System Architecture
+- Test Accuracy: 0.7755
+- Test F1: 0.8619
+- Test ROC-AUC: 0.6194
+- 5-Fold CV Accuracy: 0.7844 +- 0.0138
 
-The system follows a **Multimodal Late-Fusion Pipeline**:
+### Fair ablation (5-fold CV, logged-session dataset)
 
-1.  **Input Layer:** Captures live Video/Audio stream via WebRTC for low-latency (<300ms) transmission.
-2.  **Inference Layer:** Parallel processing of Visual and Auditory streams using lightweight CPU-optimized models (Edge Computing).
-3.  **Fusion Layer:** A weighted algorithm combines individual probability scores into a single metric.
-4.  **Decision Layer:** Updates the "Integrity Score" dashboard in real-time.
+- Multimodal (fair): Accuracy 0.7869, Balanced Accuracy 0.6066
+- Gaze only: Accuracy 0.7855, Balanced Accuracy 0.5603
+- Face only: Accuracy 0.7828, Balanced Accuracy 0.6018
+- Audio only: Accuracy 0.3336, Balanced Accuracy 0.5000
 
-### The Fusion Algorithm (Novelty)
-The core innovation is the **Weighted Integrity Metric**, which prioritizes behavioral signals over static visual checks:
+### Synthetic large-scale run (10,000 rows)
 
-$$I_{score} = (w_1 \cdot S_{gaze}) + (w_2 \cdot S_{voice}) + (w_3 \cdot S_{face})$$
+- Test Accuracy: 0.9550
+- Test F1: 0.9617
+- Test ROC-AUC: 0.9907
+- CV Accuracy: 0.9514
 
-*Where $w$ represents the adaptive weight of each modality based on signal quality (e.g., Gaze=0.4, Voice=0.3, Face=0.3).*
+### Lightweight runtime evidence (Apple M1, CPU)
 
----
+- Fusion model size: ~197 KB
+- Detector model size: ~13 MB
+- Fusion inference: ~13.37 ms/sample
+- Detector inference (640x480): ~36.47 ms/frame (~27.4 FPS)
 
-## 🛠️ 4. Installation & Setup Guide
+## Repository Structure
 
-### Prerequisites
-- Python 3.8 or higher
-- A working webcam
+```text
+.
+├── README.md
+├── project_whitepaper.md
+├── backend/
+│   ├── app.py
+│   ├── collect_data.py
+│   ├── feature_logger.py
+│   ├── train_model.py
+│   ├── generate_simulated_datasets.py
+│   ├── requirements.txt
+│   ├── efficientdet_lite0.tflite
+│   ├── dataset_logs/
+│   ├── dataset_raw/
+│   └── simulated_data/
+└── frontend/
+```
 
-### Step 1: Clone the Repository
+## Setup
+
+### 1) Create virtual environment
+
 ```bash
-git clone [https://github.com/your-username/biometric-integrity-analysis.git](https://github.com/your-username/biometric-integrity-analysis.git)
-cd biometric-integrity-analysis
+python3 -m venv .venv
+source .venv/bin/activate
 ```
----
-## Step 2: Create a Virtual Environment (Recommended)
-```
-# Windows
-python -m venv venv
-venv\Scripts\activate
 
-# Mac/Linux
-python3 -m venv venv
-source venv/bin/activate
-```
----
-## Step 3: Install Dependencies
-```
-pip install streamlit streamlit-webrtc mediapipe opencv-python-headless numpy av
-```
----
-## Step 4: Run the Application
-```
-streamlit run app.py
-```
----
-## 📂 5. Project Structure
-```
-├── app.py                 # Main Streamlit Application (MVP Logic)
-├── modules/
-│   ├── face_mesh.py       # Facial Landmark Extraction Logic
-│   ├── gaze_tracker.py    # Eye Aspect Ratio & Head Pose Logic
-│   └── audio_analysis.py  # (Future) Jitter/Shimmer Logic
-├── utils/
-│   └── helper.py          # Frame processing utilities
-├── requirements.txt       # Python dependencies list
-└── README.md              # Project Documentation
-```
----
-## Future Roadmap
-[x] Phase 1: Video-Only MVP (Face Mesh + Head Pose).
+### 2) Install dependencies
 
-[ ] Phase 2: Integration of Audio Stress Analysis (Librosa).
+```bash
+pip install -r backend/requirements.txt
+```
 
-[ ] Phase 3: Creation of a custom validation dataset (Truth vs. Deception).
+### 3) Run the app
 
-[ ] Phase 4: Validation Testing (Ablation Study) & Publication in IEEE Regional Conference.
+```bash
+streamlit run backend/app.py
+```
 
----
-## License
-Distributed under the MIT License. See LICENSE for more information. 
+## Data Collection and Training
 
----
-## 💻 Author
-**Ayushmaan Kumar Yadav** | [Know More &#8599;](https://www.ayushmaanport.dev)
+### Collect session data
+
+```bash
+python backend/collect_data.py
+```
+
+### Train on merged logged data
+
+```bash
+python backend/train_model.py
+```
+
+### Train on a specific CSV only
+
+```bash
+python backend/train_model.py --csv backend/simulated_data/simulated_10000_r58.csv
+```
+
+### Run fair ablation
+
+```bash
+python backend/train_model.py --ablation
+```
+
+### Generate synthetic benchmark datasets
+
+```bash
+python backend/generate_simulated_datasets.py
+```
+
+## Notes for Submission
+
+- Main implementation is in backend.
+- frontend is currently a placeholder directory.
+- Generated reports, plots, synthetic outputs, and model binaries are treated as artifacts and excluded from normal source tracking.
+
+## Author
+
+Ayushmaan Kumar Yadav
 

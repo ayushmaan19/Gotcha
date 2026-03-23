@@ -12,3 +12,22 @@ node_modules/
 .env
 backend/dataset_logs/
 backend/dataset_raw/
+
+# Generated ML/data artifacts
+backend/simulated_data/
+backend/*.pkl
+backend/synthetic_data.csv
+
+# Generated reports and summaries
+backend/simulated_*.txt
+backend/training_report_*.txt
+backend/ablation_report_*.txt
+backend/submission_metrics_*.md
+backend/simulated_benchmark_summary_*.md
+backend/slide_ready_*.md
+
+# Generated plots/cards
+backend/confusion_matrix_*.png
+backend/roc_curve_*.png
+backend/feature_importance_*.png
+backend/metrics_card_*.png

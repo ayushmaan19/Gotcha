@@ -177,7 +177,7 @@ class IntegrityState:
         
         # Micro-expression variance (copied from BiometricAnalyzer for logging)
         self.micro_var = 1.0
-        
+
         # Object detection flag (copied from BiometricAnalyzer for logging)
         self.object_flag = False
         
@@ -188,10 +188,7 @@ class IntegrityState:
         self.w_voice = 0.3
         self.w_face = 0.3
 
-# Persist global_state across Streamlit reruns (critical for logging)
-if "global_state" not in st.session_state:
-    st.session_state.global_state = IntegrityState()
-global_state = st.session_state.global_state
+global_state = IntegrityState()
 
 # Sync sidebar settings to thread-safe state
 with global_state.lock:
@@ -232,18 +229,17 @@ def load_ml_fusion_model():
 
 def ml_fusion_predict(gaze_score, face_score, voice_score, micro_var,
                       jitter, shimmer, spectral_centroid, anomaly_duration,
-                      object_flag) -> float:
+                      object_flag, final_integrity_score) -> float:
     """
     Get integrity score from trained ML model.
     Returns probability of legitimate * 100 (so high = good).
-    Uses 9 features (no final_integrity_score to prevent leakage).
     """
     model, feature_cols = load_ml_fusion_model()
     
     if model is None:
         return None  # Fallback signal
     
-    # Build feature vector in correct order (9 features, no leakage)
+    # Build feature vector in correct order
     feature_map = {
         "gaze_score": gaze_score,
         "face_score": face_score,
@@ -254,6 +250,7 @@ def ml_fusion_predict(gaze_score, face_score, voice_score, micro_var,
         "spectral_centroid": spectral_centroid,
         "anomaly_duration": anomaly_duration,
         "object_flag": int(object_flag),
+        "final_integrity_score": final_integrity_score,
     }
     
     try:
@@ -399,8 +396,20 @@ class AudioAnalyzer(AudioProcessorBase):
         self.rate = frame.sample_rate or self.rate
         self.buffer_target = self.rate  # keep 1 s
 
-        # stereo -> mono
-        mono = np.mean(raw, axis=1) if raw.ndim > 1 and raw.shape[1] > 1 else raw.flatten()
+        # Convert to mono robustly for both layouts:
+        # - planar/channel-first: (channels, samples)
+        # - interleaved/sample-first: (samples, channels)
+        if raw.ndim == 1:
+            mono = raw.astype(np.float32, copy=False)
+        elif raw.ndim == 2:
+            # Heuristic: very small first dimension usually means channel-first.
+            if raw.shape[0] <= 8 and raw.shape[1] > raw.shape[0]:
+                mono = np.mean(raw, axis=0)
+            else:
+                mono = np.mean(raw, axis=1)
+        else:
+            mono = raw.reshape(-1)
+
         if mono.dtype != np.float32:
             mono = mono.astype(np.float32) / 32768.0
 
@@ -775,6 +784,7 @@ class BiometricAnalyzer(VideoProcessorBase):
                 spectral_centroid=spectral_centroid,
                 anomaly_duration=anomaly_time,
                 object_flag=suspicious_object_found,
+                final_integrity_score=self.integrity_score,
             )
             if ml_score is not None:
                 fused = ml_score
@@ -1195,6 +1205,7 @@ while True:
         _face      = global_state.face_score
         _voice     = global_state.voice_score
         _audio_msg = global_state.audio_msg
+        _object_flag = global_state.object_flag
         
         # Add data point if video processor hasn't updated recently (keeps graph alive)
         elapsed = time.time() - global_state.session_start
@@ -1206,14 +1217,10 @@ while True:
         _times     = list(global_state.time_history)
         _scores    = list(global_state.score_history)
 
-    # Dataset logging (modular, non-blocking) — only when WebRTC is streaming
-    if st.session_state.feature_logger is not None and webrtc_ctx.state.playing:
-        features = extract_features_from_state(global_state)
+    # Dataset logging (modular, non-blocking)
+    if st.session_state.feature_logger is not None:
+        features = extract_features_from_state(global_state, object_detected=_object_flag)
         st.session_state.feature_logger.log_features(features, LOGGING_LABEL_INT)
-        # Debug: print logged values to console
-        print(f"[LOG] gaze={features['gaze_score']:.1f} face={features['face_score']:.1f} voice={features['voice_score']:.1f} "
-              f"micro={features['micro_var']:.4f} jitter={features['jitter']:.2f} shimmer={features['shimmer']:.2f} "
-              f"anomaly={features['anomaly_duration']:.2f} obj={features['object_flag']} label={LOGGING_LABEL_INT}")
 
     draw_dashboard(
         score=_score,

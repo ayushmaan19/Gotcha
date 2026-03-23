@@ -74,7 +74,8 @@ def load_dataset(csv_path: str = None, merge_logs: bool = True) -> pd.DataFrame:
         for f in log_files:
             try:
                 df = pd.read_csv(f)
-                if len(df) > 0:
+                # Skip near-empty logs (often interrupted sessions)
+                if len(df) > 1:
                     dfs.append(df)
                     print(f"    → Loaded {len(df)} samples from {os.path.basename(f)}")
             except Exception as e:
@@ -147,7 +148,7 @@ def generate_synthetic_dataset(n_samples: int = 2000, seed: int = 42) -> pd.Data
 
 
 def get_feature_columns() -> list:
-    """Return the feature columns used for training (9 features, no leakage)."""
+    """Return the feature columns used for training."""
     return [
         "gaze_score",
         "face_score",
@@ -158,6 +159,7 @@ def get_feature_columns() -> list:
         "spectral_centroid",
         "anomaly_duration",
         "object_flag",
+        "final_integrity_score",
     ]
 
 
@@ -379,15 +381,26 @@ def run_ablation_study(df: pd.DataFrame):
     all_features = get_feature_columns()
     
     # Define ablation configurations
+    # Fair comparison: multimodal core excludes final_integrity_score because it is
+    # already a fused heuristic score and can mask single-modality differences.
+    multimodal_core = [
+        "gaze_score",
+        "face_score",
+        "voice_score",
+        "micro_var",
+        "jitter",
+        "shimmer",
+        "spectral_centroid",
+        "anomaly_duration",
+        "object_flag",
+    ]
+
     configs = {
-        "All Features": all_features,
-        "Without Gaze": [f for f in all_features if f not in ["gaze_score"]],
-        "Without Audio": [f for f in all_features if f not in ["voice_score", "jitter", "shimmer", "spectral_centroid"]],
-        "Without Face": [f for f in all_features if f not in ["face_score", "micro_var"]],
-        "Without Object": [f for f in all_features if f not in ["object_flag"]],
+        "Multimodal (Fair)": multimodal_core,
         "Gaze Only": ["gaze_score", "anomaly_duration"],
-        "Audio Only": ["voice_score", "jitter", "shimmer", "spectral_centroid"],
         "Face Only": ["face_score", "micro_var"],
+        "Audio Only": ["voice_score", "jitter", "shimmer", "spectral_centroid"],
+        "With Pre-Fused Score": all_features,
     }
     
     results = []
@@ -404,45 +417,47 @@ def run_ablation_study(df: pd.DataFrame):
         
         X = df[features].values
         y = df["label"].values.astype(int)
-        
-        # 80/20 split
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.20, random_state=RANDOM_STATE, stratify=y
+
+        # Use CV means for stable comparisons on imbalanced datasets
+        clf = RandomForestClassifier(
+            n_estimators=200,
+            max_depth=12,
+            min_samples_leaf=5,
+            class_weight="balanced",
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
         )
-        
-        # Train
-        clf = train_random_forest(X_train, y_train)
-        
-        # Evaluate (without plots for ablation)
-        y_pred = clf.predict(X_test)
-        y_proba = clf.predict_proba(X_test)[:, 1]
-        
-        accuracy = accuracy_score(y_test, y_pred)
-        f1 = f1_score(y_test, y_pred, zero_division=0)
-        try:
-            roc_auc = roc_auc_score(y_test, y_proba)
-        except ValueError:
-            roc_auc = 0.5
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+        cv_acc = cross_val_score(clf, X, y, cv=cv, scoring="accuracy")
+        cv_f1 = cross_val_score(clf, X, y, cv=cv, scoring="f1")
+        cv_auc = cross_val_score(clf, X, y, cv=cv, scoring="roc_auc")
+        cv_bal_acc = cross_val_score(clf, X, y, cv=cv, scoring="balanced_accuracy")
+
+        accuracy = float(cv_acc.mean())
+        f1 = float(cv_f1.mean())
+        roc_auc = float(cv_auc.mean())
+        bal_acc = float(cv_bal_acc.mean())
         
         results.append({
             "Configuration": config_name,
             "Accuracy": accuracy,
             "F1": f1,
             "ROC-AUC": roc_auc,
+            "Balanced-Acc": bal_acc,
             "Features": len(features),
         })
         
-        print(f"    Accuracy: {accuracy:.4f} | F1: {f1:.4f} | ROC-AUC: {roc_auc:.4f}")
+        print(f"    Accuracy: {accuracy:.4f} | F1: {f1:.4f} | ROC-AUC: {roc_auc:.4f} | Bal-Acc: {bal_acc:.4f}")
     
     # Print comparison table
     print("\n" + "="*70)
     print("ABLATION RESULTS SUMMARY")
     print("="*70)
-    print(f"{'Configuration':<20s} | {'Accuracy':>10s} | {'F1':>10s} | {'ROC-AUC':>10s} | {'#Feat':>6s}")
-    print("-"*70)
+    print(f"{'Configuration':<24s} | {'Accuracy':>10s} | {'F1':>10s} | {'ROC-AUC':>10s} | {'Bal-Acc':>10s} | {'#Feat':>6s}")
+    print("-"*92)
     for r in results:
-        print(f"{r['Configuration']:<20s} | {r['Accuracy']:>10.4f} | {r['F1']:>10.4f} | {r['ROC-AUC']:>10.4f} | {r['Features']:>6d}")
-    print("="*70)
+        print(f"{r['Configuration']:<24s} | {r['Accuracy']:>10.4f} | {r['F1']:>10.4f} | {r['ROC-AUC']:>10.4f} | {r['Balanced-Acc']:>10.4f} | {r['Features']:>6d}")
+    print("="*92)
     
     return results
 
@@ -454,10 +469,8 @@ def run_ablation_study(df: pd.DataFrame):
 def main(csv_path: str = None, ablation: bool = False):
     """Main training pipeline."""
     
-    print("[INFO] Training without final_integrity_score to prevent leakage.")
-    
     # Load data
-    df = load_dataset(csv_path=csv_path)
+    df = load_dataset(csv_path=csv_path, merge_logs=(csv_path is None))
     
     if len(df) < 20:
         print("[!] Insufficient data. Need at least 20 samples.")

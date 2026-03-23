@@ -1,68 +1,108 @@
-# Real-Time Multimodal Biometric Integrity Analysis (RMBIA)
+<h1 align="center">🔐 Real-Time Multimodal Biometric Integrity Analysis (RMBIA)</h1>
 
-A lightweight, CPU-first multimodal integrity scoring system for remote communication.
-The project combines face, gaze, audio, and context features in real time and uses a trained fusion model for suspicious-behavior detection.
+<p align="center">
+	<b>Zero-trust behavioral security for remote communication</b><br/>
+	Face + Gaze + Audio + Context fused into a lightweight real-time integrity score.
+</p>
 
-## Overview
+<p align="center">
+	<img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white" />
+	<img src="https://img.shields.io/badge/Streamlit-Realtime-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white" />
+	<img src="https://img.shields.io/badge/Model-RandomForest-2E7D32?style=for-the-badge" />
+	<img src="https://img.shields.io/badge/Inference-CPU%20Optimized-1565C0?style=for-the-badge" />
+	<img src="https://img.shields.io/badge/Status-Submission%20Ready-6A1B9A?style=for-the-badge" />
+</p>
 
-RMBIA is designed for continuous behavioral verification during a video session.
-Instead of one-time login authentication, it continuously tracks behavioral and physiological signals to estimate an integrity/risk score.
+---
 
-Primary use case: detecting social engineering indicators such as coached responses, abnormal gaze patterns, liveness inconsistency, and audio stress anomalies.
+## ✨ Why This Project
 
-## What Is Implemented
+Most systems validate identity once at login. RMBIA keeps validating behavior during the session.
 
-- Real-time Streamlit + WebRTC pipeline.
-- Face-based features (liveness variance and expression stability).
-- Gaze/blink features (attention drift, blink behavior).
-- Audio forensics features (jitter, shimmer proxies, spectral descriptors).
-- Optional object-context signal via EfficientDet Lite0.
-- ML fusion with RandomForest and a live dashboard score.
-- Dataset logger for supervised model training.
-- Training and ablation pipeline with plots and reports.
-- Synthetic dataset generator for rapid scale-up experiments.
+It focuses on social engineering and impersonation cues such as:
+- 👀 suspicious gaze behavior
+- 🙂 liveness/expression inconsistency
+- 🎙️ audio stress anomalies
+- 📦 contextual scene/object signals
 
-## Latest Updates (March 2026)
+---
 
-- Fixed audio mono conversion robustness in the real-time stream path to handle channel layout differences.
-- Restored object detection flag propagation into logged features for true multimodal capture.
-- Updated ablation pipeline for fair multimodal vs single-modality comparison.
-- Added Balanced Accuracy to handle class imbalance more honestly.
-- Fixed training behavior so custom CSV runs do not auto-merge session logs unintentionally.
-- Added synthetic benchmark generation script for 10k-60k controlled experiments.
-- Expanded ignore rules to keep generated artifacts and binaries out of normal source commits.
+## 🧠 Core Pipeline
 
-## Verified Results Snapshot
+1. 📹 Capture live video/audio through WebRTC.
+2. ⚙️ Extract multimodal features (face, gaze, audio, context).
+3. 🧬 Fuse signals with a trained RandomForest model.
+4. 🚨 Update real-time integrity risk on dashboard.
 
-### Real logged-session dataset (732 rows)
+---
 
-- Test Accuracy: 0.7755
-- Test F1: 0.8619
-- Test ROC-AUC: 0.6194
-- 5-Fold CV Accuracy: 0.7844 +- 0.0138
+## ✅ What Is Implemented
 
-### Fair ablation (5-fold CV, logged-session dataset)
+- 🎥 Real-time Streamlit + WebRTC app
+- 🧍 Face liveness and micro-expression variance features
+- 👁️ Gaze and blink behavior tracking
+- 🔊 Audio forensics-style features (jitter/shimmer proxies, spectral stats)
+- 📦 Optional context signal using EfficientDet Lite0
+- 🤝 Fusion model with supervised training pipeline
+- 🧾 Session-level feature logger
+- 📊 Training + ablation + evaluation plots
+- 🧪 Synthetic dataset generation for rapid scaling experiments
 
-- Multimodal (fair): Accuracy 0.7869, Balanced Accuracy 0.6066
-- Gaze only: Accuracy 0.7855, Balanced Accuracy 0.5603
-- Face only: Accuracy 0.7828, Balanced Accuracy 0.6018
-- Audio only: Accuracy 0.3336, Balanced Accuracy 0.5000
+---
 
-### Synthetic large-scale run (10,000 rows)
+## 🛠️ Latest Updates (March 2026)
 
-- Test Accuracy: 0.9550
-- Test F1: 0.9617
-- Test ROC-AUC: 0.9907
-- CV Accuracy: 0.9514
+- 🧯 Fixed audio mono conversion for channel-layout robustness in live stream processing.
+- 🔁 Restored object detection flag propagation into logged features.
+- ⚖️ Upgraded ablation to fair multimodal-vs-single-modality comparison.
+- 🎯 Added Balanced Accuracy for imbalanced-class evaluation.
+- 🧼 Fixed CSV training path to prevent unintended auto-merge with session logs.
+- 🚀 Added synthetic benchmark generator for 10k-60k dataset runs.
+- 🗂️ Expanded ignore rules to keep generated artifacts out of clean source pushes.
 
-### Lightweight runtime evidence (Apple M1, CPU)
+---
 
-- Fusion model size: ~197 KB
-- Detector model size: ~13 MB
-- Fusion inference: ~13.37 ms/sample
-- Detector inference (640x480): ~36.47 ms/frame (~27.4 FPS)
+## 📈 Results Snapshot
 
-## Repository Structure
+### 📌 Real Logged Session Dataset (732 rows)
+
+| Metric | Value |
+|---|---:|
+| Test Accuracy | 0.7755 |
+| Test F1 | 0.8619 |
+| Test ROC-AUC | 0.6194 |
+| 5-Fold CV Accuracy | 0.7844 +- 0.0138 |
+
+### ⚖️ Fair Ablation (5-Fold CV)
+
+| Configuration | Accuracy | Balanced Accuracy |
+|---|---:|---:|
+| Multimodal (Fair) | 0.7869 | 0.6066 |
+| Gaze Only | 0.7855 | 0.5603 |
+| Face Only | 0.7828 | 0.6018 |
+| Audio Only | 0.3336 | 0.5000 |
+
+### 🧪 Synthetic Large-Scale Run (10,000 rows)
+
+| Metric | Value |
+|---|---:|
+| Test Accuracy | 0.9550 |
+| Test F1 | 0.9617 |
+| Test ROC-AUC | 0.9907 |
+| CV Accuracy | 0.9514 |
+
+### ⚡ Lightweight Runtime (Apple M1, CPU)
+
+| Component | Value |
+|---|---:|
+| Fusion model size | ~197 KB |
+| Detector model size | ~13 MB |
+| Fusion inference | ~13.37 ms/sample |
+| Detector inference (640x480) | ~36.47 ms/frame (~27.4 FPS) |
+
+---
+
+## 🗂️ Project Structure
 
 ```text
 .
@@ -82,28 +122,32 @@ Primary use case: detecting social engineering indicators such as coached respon
 └── frontend/
 ```
 
-## Setup
+---
 
-### 1) Create virtual environment
+## 🚀 Quick Start
+
+### 1. Create virtual environment
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-### 2) Install dependencies
+### 2. Install dependencies
 
 ```bash
 pip install -r backend/requirements.txt
 ```
 
-### 3) Run the app
+### 3. Run real-time app
 
 ```bash
 streamlit run backend/app.py
 ```
 
-## Data Collection and Training
+---
+
+## 🧪 Data and Training Commands
 
 ### Collect session data
 
@@ -135,13 +179,17 @@ python backend/train_model.py --ablation
 python backend/generate_simulated_datasets.py
 ```
 
-## Notes for Submission
+---
 
-- Main implementation is in backend.
-- frontend is currently a placeholder directory.
-- Generated reports, plots, synthetic outputs, and model binaries are treated as artifacts and excluded from normal source tracking.
+## 📝 Submission Notes
 
-## Author
+- Backend contains the full working implementation.
+- Frontend folder is currently a placeholder.
+- Generated reports/plots/models are treated as build artifacts and excluded from normal source tracking.
 
-Ayushmaan Kumar Yadav
+---
+
+## 👨‍💻 Author
+
+**Ayushmaan Kumar Yadav**
 

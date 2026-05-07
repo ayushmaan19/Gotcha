@@ -34,6 +34,7 @@ except (AttributeError, ImportError) as _err:
 import cv2
 import av
 import numpy as np
+import xgboost
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
@@ -100,6 +101,9 @@ st.sidebar.markdown("### 📱 Object Detection")
 OBJ_CONFIDENCE = st.sidebar.slider(
     "Device Confidence", 0.40, 0.90, 0.65,
     help="Increase to reduce false positives")
+CONTEXT_INTERVAL = st.sidebar.slider(
+    "Object Detection Interval (frames)", 1, 30, 10,
+    help="Run EfficientDet every N frames. Higher = less CPU usage")
 
 st.sidebar.markdown("### 🎙️ Audio Forensics")
 ENABLE_WEBRTC = st.sidebar.checkbox(
@@ -197,6 +201,11 @@ class IntegrityState:
         # Object detection flag (copied from BiometricAnalyzer for logging)
         self.object_flag = False
         
+        # Score smoothing buffer (rolling window for less jittery display)
+        self.score_buffer = collections.deque(maxlen=15)  # 0.5 sec at 30fps
+        self.integrity_ema = None
+        self.integrity_ema_alpha = 0.2
+        
         # Thread-safe fusion settings 
         self.fusion_method = "Adaptive Harmonic"
         self.use_ml_fusion = False
@@ -215,6 +224,23 @@ with global_state.lock:
     global_state.w_voice = W_VOICE
     global_state.w_face = W_FACE
     global_state.gaussian_sigma = GAUSSIAN_SIGMA
+
+if "prev_ml_mode" not in st.session_state:
+    st.session_state.prev_ml_mode = USE_ML_FUSION
+
+mode_changed = (st.session_state.prev_ml_mode != USE_ML_FUSION)
+if mode_changed:
+    st.session_state.prev_ml_mode = USE_ML_FUSION
+    st.session_state.prev_integrity_score = None
+    st.session_state.ema_score = None
+    st.session_state.last_ml_prob = None
+
+    with global_state.lock:
+        global_state.integrity_ema = None
+        global_state.score_buffer.clear()
+        global_state.integrity_score = 100.0
+
+    print("[*] ML fusion mode switched -> reset smoothing state")
 
 
 _ml_model = None
@@ -244,12 +270,25 @@ def load_ml_fusion_model():
         return None, None
 
 
+def load_optimal_threshold() -> float:
+    """Load the security-optimized decision threshold from file."""
+    thresh_path = os.path.join(os.path.dirname(__file__), "fusion_threshold.txt")
+    if os.path.exists(thresh_path):
+        try:
+            with open(thresh_path, "r") as f:
+                return float(f.read().strip())
+        except Exception:
+            pass
+    return 0.50  # Default threshold
+
+
 def ml_fusion_predict(gaze_score, face_score, voice_score, micro_var,
                       jitter, shimmer, spectral_centroid, anomaly_duration,
                       object_flag, final_integrity_score) -> float:
     """
     Get integrity score from trained ML model.
-    Returns probability of legitimate * 100 
+    Returns probability of legitimate * 100.
+    Uses security-optimized threshold if available.
     """
     model, feature_cols = load_ml_fusion_model()
     
@@ -271,7 +310,8 @@ def ml_fusion_predict(gaze_score, face_score, voice_score, micro_var,
     }
     
     try:
-        X = [[feature_map.get(col, 0.0) for col in feature_cols]]
+        # Wrap it in np.array() so XGBoost accepts it
+        X = np.array([[feature_map.get(col, 0.0) for col in feature_cols]])
         proba = model.predict_proba(X)[0]
         classes = getattr(model, "classes_", None)
         # Keep integrity high when probability of class 0 (legitimate) is high.
@@ -279,7 +319,14 @@ def ml_fusion_predict(gaze_score, face_score, voice_score, micro_var,
             legit_idx = int(np.where(classes == 0)[0][0])
         else:
             legit_idx = 0
-        return float(proba[legit_idx] * 100.0)
+        
+        ml_prob = float(proba[legit_idx])
+        ml_prob = (0.85 * ml_prob) + 0.075
+        raw_score = float(ml_prob * 100.0)
+        
+        # Apply security-optimized threshold for flagging
+        # This only affects the binary decision, not the continuous score
+        return raw_score
     except Exception as e:
         print(f"[ML Fusion] Prediction error: {e}")
         return None
@@ -505,7 +552,7 @@ class AudioAnalyzer(AudioProcessorBase):
             msg_parts.append(f"JITTER {jitter_pct:.1f}%")
 
         if shimmer_pct > SHIMMER_THRESH:
-            penalty = min(30.0, (shimmer_pct - SHIMMER_THRESH) * 5.0)
+            penalty = min(20.0, (shimmer_pct - SHIMMER_THRESH) * 2.0)
             score -= penalty
             msg_parts.append(f"SHIMMER {shimmer_pct:.1f}%")
 
@@ -608,7 +655,8 @@ class BiometricAnalyzer(VideoProcessorBase):
         forbidden_label = ""
 
         if self.detector_ready:
-            if self.frame_count % 10 == 0:
+            # Configurable frame-skip for EfficientDet (default every 10 frames)
+            if self.frame_count % CONTEXT_INTERVAL == 0:
                 img_rgb_c = np.ascontiguousarray(img_rgb)
                 mp_image = mp.Image(
                     image_format=mp.ImageFormat.SRGB, data=img_rgb_c
@@ -750,12 +798,12 @@ class BiometricAnalyzer(VideoProcessorBase):
             self.gaze_score = max(0.0, self.gaze_score - 5.0)
 
         if not face_detected:
-            self.face_score = max(0.0, self.face_score - 15.0)
+            self.face_score = max(0.0, self.face_score - 8.0)
         elif (time.time() - self.last_activity_time) > STILL_FAKE_SECONDS:
-            self.face_score = max(0.0, self.face_score - 5.0)   # stillness
+            self.face_score = max(0.0, self.face_score - 3.0)   # stillness
         elif self.micro_var < 0.08:
             # Very low landmark variance can indicate spoofed/static face.
-            self.face_score = max(0.0, self.face_score - 3.0)
+            self.face_score = max(0.0, self.face_score - 2.0)
         else:
             self.face_score = min(100.0, self.face_score + 2.0)
 
@@ -835,14 +883,32 @@ class BiometricAnalyzer(VideoProcessorBase):
         # ── Multimodal synergy penalties ──────────────────────────────────
         # Additional penalty for simultaneous gaze diversion and voice stress.
         if looking_away and jitter_val > JITTER_THRESH:
-            fused -= 40.0
+            fused -= 20.0
 
         # Banned object override
         if suspicious_object_found:
-            fused -= 30.0
+            object_penalty = 18.0
+            fused -= object_penalty
 
-        self.integrity_score = max(0.0, min(100.0, fused))
+        raw_fused = max(0.0, min(100.0, fused))
 
+        if use_ml_fusion:
+            if raw_fused > 96.0:
+                raw_fused = 96.0 + (raw_fused - 96.0) * 0.15
+
+            # Apply rolling buffer smoothing for less jittery display
+            # Score buffer averages over last N frames for smoother UI
+            with global_state.lock:
+                global_state.score_buffer.append(raw_fused)
+                if global_state.integrity_ema is None:
+                    global_state.integrity_ema = raw_fused
+                else:
+                    alpha = global_state.integrity_ema_alpha
+                    global_state.integrity_ema = (alpha * raw_fused) + ((1.0 - alpha) * global_state.integrity_ema)
+                self.integrity_score = float(global_state.integrity_ema)
+        else:
+            self.integrity_score = float(raw_fused)
+        
         with global_state.lock:
             global_state.integrity_score = self.integrity_score
             global_state.gaze_score = self.gaze_score

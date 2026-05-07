@@ -1,17 +1,3 @@
-"""
-SDP-1: Real Face Data Collector
-================================
-Records YOUR face data for training a personalized integrity model.
-
-Usage:
-  python collect_data.py
-
-Controls:
-  Hold '0' → Record LEGITIMATE behavior (looking at screen, natural)
-  Hold '1' → Record SUSPICIOUS behavior (looking away, phone, etc.)
-  Press 'q' → Quit and save data
-"""
-
 import csv
 import cv2
 import mediapipe as mp
@@ -19,7 +5,6 @@ import numpy as np
 import os
 import re
 
-# ── MediaPipe Setup ──────────────────────────────────────────────────────────
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
     refine_landmarks=True,
@@ -61,7 +46,6 @@ def calculate_yaw(landmarks):
     return 0.0
 
 
-# ── CSV Setup (Auto-Increment Session Numbering) ────────────────────────────
 DATASET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset_raw")
 os.makedirs(DATASET_DIR, exist_ok=True)
 
@@ -83,7 +67,7 @@ writer = csv.writer(csv_file)
 writer.writerow(["yaw", "ear", "volume", "label"])
 
 print("=" * 60)
-print("        SDP-1: FACE DATA COLLECTOR")
+print("Face Data Collector")
 print("=" * 60)
 print("\nControls:")
 print("  Hold '0' → Record LEGITIMATE (looking at screen)")
@@ -92,7 +76,6 @@ print("  Press 'q' → Save and quit")
 print("\nTip: Record ~200+ samples of each class for best results")
 print("=" * 60)
 
-# ── Camera Loop ──────────────────────────────────────────────────────────────
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -135,7 +118,6 @@ while cap.isOpened():
             pt = landmarks[idx]
             cv2.circle(frame, (int(pt.x * w), int(pt.y * h)), 5, (255, 0, 255), -1)
     
-    # ── UI Overlay ───────────────────────────────────────────────────────
     # Background panel
     cv2.rectangle(frame, (0, 0), (w, 100), (0, 0, 0), -1)
     
@@ -153,7 +135,6 @@ while cap.isOpened():
     
     cv2.imshow('SDP-1 Data Collector', frame)
     
-    # ── Key Handling ─────────────────────────────────────────────────────
     key = cv2.waitKey(5) & 0xFF
     
     if key == ord('q'):
@@ -169,7 +150,6 @@ while cap.isOpened():
         sus_count += 1
         print(f"[SUSPI #{sus_count}] Yaw={yaw:.2f}, EAR={ear:.3f}")
 
-# ── Cleanup ──────────────────────────────────────────────────────────────────
 cap.release()
 cv2.destroyAllWindows()
 csv_file.close()

@@ -4,6 +4,7 @@ backend/venv/
 __pycache__/
 *.pyc
 .DS_Store
+.vscode/
 
 # Node
 node_modules/
@@ -16,6 +17,7 @@ backend/dataset_raw/
 # Generated ML/data artifacts
 backend/simulated_data/
 backend/*.pkl
+!backend/fusion_model.pkl
 backend/synthetic_data.csv
 
 # Generated reports and summaries
@@ -31,3 +33,15 @@ backend/confusion_matrix_*.png
 backend/roc_curve_*.png
 backend/feature_importance_*.png
 backend/metrics_card_*.png
+
+# Local scripts and diagrams
+run_gotcha.sh
+diagrams/
+
+# Extra backend assets (non-core)
+backend/Confusion_Matrix/
+backend/feature_Importance/
+backend/detailed_architecture_flow_graph.py
+backend/formula_flow_visualization.py
+backend/guide_table_visualizations.py
+backend/latest_results_*.md

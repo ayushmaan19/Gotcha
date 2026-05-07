@@ -1,22 +1,4 @@
-"""
-SDP-1: Integrity Model Trainer (Research Edition)
-=================================================
-Refactored for research evaluation with:
-- Structured functions
-- 80/20 split + 5-fold cross validation
-- Full metrics suite (Accuracy, Precision, Recall, F1, ROC-AUC)
-- Confusion matrix, ROC curve, Feature importance plots
-- Ablation study mode
-
-Usage:
-  python train_model.py                         # Train with default/synthetic data
-  python train_model.py --csv my_face_data.csv  # Train with real data
-  python train_model.py --ablation              # Run ablation study
-
-Expected CSV schema from dataset_logs/:
-  gaze_score, face_score, voice_score, micro_var, jitter, shimmer,
-  spectral_centroid, anomaly_duration, object_flag, final_integrity_score, label
-"""
+"""Training pipeline for multimodal fusion models and evaluation reports."""
 
 import argparse
 import os
@@ -28,33 +10,39 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
 from sklearn.metrics import (
     classification_report, confusion_matrix, accuracy_score,
     precision_score, recall_score, f1_score, roc_auc_score, roc_curve
 )
+from sklearn.inspection import permutation_importance
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for server
 import matplotlib.pyplot as plt
 
 
-# ── Configuration ────────────────────────────────────────────────────────────
 MODEL_OUT = "fusion_model.pkl"
 DATASET_DIR = "dataset_logs"
+SIM_DATA_DIR = "simulated_data"
 RANDOM_STATE = 42
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 #  STEP 1: LOAD DATASET
-# ══════════════════════════════════════════════════════════════════════════════
 
-def load_dataset(csv_path: str = None, merge_logs: bool = True) -> pd.DataFrame:
+def load_dataset(csv_path: str = None,
+                 merge_logs: bool = True,
+                 include_simulated: bool = True) -> pd.DataFrame:
     """
     Load dataset from CSV file(s).
     
     Args:
         csv_path: Path to specific CSV file (optional)
         merge_logs: If True, merge all CSVs from dataset_logs/ directory
+        include_simulated: If True, also merge CSVs from simulated_data/
     
     Returns:
         pd.DataFrame with features and labels
@@ -75,6 +63,19 @@ def load_dataset(csv_path: str = None, merge_logs: bool = True) -> pd.DataFrame:
             try:
                 df = pd.read_csv(f)
                 # Skip near-empty logs (often interrupted sessions)
+                if len(df) > 1:
+                    dfs.append(df)
+                    print(f"    → Loaded {len(df)} samples from {os.path.basename(f)}")
+            except Exception as e:
+                print(f"    [!] Error loading {f}: {e}")
+
+    # Merge simulated datasets if enabled
+    if merge_logs and include_simulated and os.path.isdir(SIM_DATA_DIR):
+        sim_files = glob.glob(os.path.join(SIM_DATA_DIR, "*.csv"))
+        print(f"[*] Found {len(sim_files)} simulated CSVs in {SIM_DATA_DIR}/")
+        for f in sim_files:
+            try:
+                df = pd.read_csv(f)
                 if len(df) > 1:
                     dfs.append(df)
                     print(f"    → Loaded {len(df)} samples from {os.path.basename(f)}")
@@ -163,9 +164,7 @@ def get_feature_columns() -> list:
     ]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 #  STEP 2: TRAIN RANDOM FOREST
-# ══════════════════════════════════════════════════════════════════════════════
 
 def train_random_forest(X_train: np.ndarray, y_train: np.ndarray,
                         n_estimators: int = 200,
@@ -199,11 +198,44 @@ def train_random_forest(X_train: np.ndarray, y_train: np.ndarray,
     return clf
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  STEP 3: EVALUATE MODEL
-# ══════════════════════════════════════════════════════════════════════════════
+def train_calibrated_logistic_formula(X_train: np.ndarray,
+                                      y_train: np.ndarray):
+    """
+    Train a calibrated logistic fusion model.
 
-def evaluate_model(clf: RandomForestClassifier,
+    Formula class:
+      p(y=1) = sigmoid(beta0 + beta^T x + interaction terms)
+
+    Implemented as a pipeline with pairwise interactions + scaling,
+    wrapped in probability calibration for better confidence quality.
+    """
+    print("[*] Training calibrated logistic fusion formula (with interactions)...")
+
+    base_pipe = Pipeline([
+        ("poly", PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)),
+        ("scaler", StandardScaler()),
+        ("logreg", LogisticRegression(
+            C=1.0,
+            class_weight="balanced",
+            max_iter=2000,
+            solver="lbfgs",
+            random_state=RANDOM_STATE,
+        )),
+    ])
+
+    clf = CalibratedClassifierCV(
+        estimator=base_pipe,
+        method="sigmoid",
+        cv=3,
+    )
+    clf.fit(X_train, y_train)
+    print(f"    → Training complete. {len(y_train)} samples used.")
+    return clf
+
+
+#  STEP 3: EVALUATE MODEL
+
+def evaluate_model(clf,
                    X_train: np.ndarray, y_train: np.ndarray,
                    X_test: np.ndarray, y_test: np.ndarray,
                    feature_cols: list,
@@ -272,9 +304,9 @@ def evaluate_model(clf: RandomForestClassifier,
     print(f"  CV F1-Score: {cv_f1.mean():.4f} ± {cv_f1.std():.4f}")
     print(f"  CV ROC-AUC:  {cv_roc_auc.mean():.4f} ± {cv_roc_auc.std():.4f}")
     
-    # Feature importance
+    # Feature importance (tree importances or permutation fallback)
     print(f"\n── Feature Importances ──")
-    importances = clf.feature_importances_
+    importances = _extract_feature_importances(clf, X_test, y_test, feature_cols)
     sorted_idx = np.argsort(importances)[::-1]
     for i in sorted_idx:
         print(f"  {feature_cols[i]:<25s} {importances[i]:.4f}")
@@ -293,6 +325,31 @@ def evaluate_model(clf: RandomForestClassifier,
         "cv_f1_mean": cv_f1.mean(),
         "cv_roc_auc_mean": cv_roc_auc.mean(),
     }
+
+
+def _extract_feature_importances(clf, X_ref: np.ndarray, y_ref: np.ndarray, feature_cols: list) -> np.ndarray:
+    """Return importances for both tree and non-tree models."""
+    if hasattr(clf, "feature_importances_"):
+        return np.asarray(clf.feature_importances_)
+
+    # Generic fallback for calibrated/pipeline models
+    try:
+        perm = permutation_importance(
+            clf,
+            X_ref,
+            y_ref,
+            n_repeats=5,
+            random_state=RANDOM_STATE,
+            scoring="roc_auc",
+            n_jobs=-1,
+        )
+        imp = np.maximum(perm.importances_mean, 0.0)
+        if float(np.sum(imp)) > 0:
+            imp = imp / np.sum(imp)
+        return imp
+    except Exception as e:
+        print(f"[!] Could not compute permutation importance: {e}")
+        return np.zeros(len(feature_cols), dtype=float)
 
 
 def _save_evaluation_plots(cm: np.ndarray, y_test: np.ndarray, y_proba: np.ndarray,
@@ -347,22 +404,50 @@ def _save_evaluation_plots(cm: np.ndarray, y_test: np.ndarray, y_proba: np.ndarr
         print(f"[!] Could not generate ROC curve: {e}")
     
     # 3. Feature Importance Plot
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(12, 7))
     sorted_idx = np.argsort(importances)
-    ax.barh(range(len(importances)), importances[sorted_idx], color='steelblue')
+    sorted_importances = importances[sorted_idx]
+    sorted_features = [feature_cols[i] for i in sorted_idx]
+    bars = ax.barh(
+        range(len(sorted_importances)),
+        sorted_importances,
+        color='#2C7FB8',
+        edgecolor='#0B3C5D',
+        linewidth=1.2,
+        alpha=0.95,
+    )
     ax.set_yticks(range(len(importances)))
-    ax.set_yticklabels([feature_cols[i] for i in sorted_idx])
-    ax.set_xlabel('Importance')
-    ax.set_title('Feature Importances (Random Forest)')
+    ax.set_yticklabels(sorted_features, fontsize=16, fontweight='bold')
+    ax.set_xlabel('Importance', fontsize=18, fontweight='bold', labelpad=10)
+    ax.set_title('Feature Importances (Random Forest)', fontsize=24, fontweight='bold', pad=14)
+    ax.tick_params(axis='x', labelsize=14)
+    for tick_label in ax.get_xticklabels():
+        tick_label.set_fontweight('bold')
+
+    # Add values on each bar to improve readability in paper figures.
+    max_importance = float(sorted_importances.max()) if len(sorted_importances) else 0.0
+    for bar, value in zip(bars, sorted_importances):
+        ax.text(
+            bar.get_width() + max_importance * 0.01,
+            bar.get_y() + bar.get_height() / 2,
+            f"{value:.3f}",
+            va='center',
+            ha='left',
+            fontsize=12,
+            fontweight='bold',
+            color='#0B3C5D',
+        )
+
+    ax.grid(axis='x', linestyle='--', alpha=0.25)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
     plt.tight_layout()
-    plt.savefig(f"feature_importance_{timestamp}.png", dpi=150)
+    plt.savefig(f"feature_importance_{timestamp}.png", dpi=300, bbox_inches='tight')
     plt.close()
     print(f"[*] Saved: feature_importance_{timestamp}.png")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 #  STEP 4: ABLATION STUDY
-# ══════════════════════════════════════════════════════════════════════════════
 
 def run_ablation_study(df: pd.DataFrame):
     """
@@ -462,15 +547,20 @@ def run_ablation_study(df: pd.DataFrame):
     return results
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 #  MAIN ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
 
-def main(csv_path: str = None, ablation: bool = False):
+def main(csv_path: str = None,
+         ablation: bool = False,
+         model_type: str = "calibrated",
+         include_simulated: bool = True):
     """Main training pipeline."""
     
     # Load data
-    df = load_dataset(csv_path=csv_path, merge_logs=(csv_path is None))
+    df = load_dataset(
+        csv_path=csv_path,
+        merge_logs=(csv_path is None),
+        include_simulated=include_simulated,
+    )
     
     if len(df) < 20:
         print("[!] Insufficient data. Need at least 20 samples.")
@@ -502,7 +592,12 @@ def main(csv_path: str = None, ablation: bool = False):
     print(f"    Train: {len(X_train)} | Test: {len(X_test)}")
     
     # Train
-    clf = train_random_forest(X_train, y_train)
+    if model_type == "rf":
+        clf = train_random_forest(X_train, y_train)
+        model_name = "random_forest"
+    else:
+        clf = train_calibrated_logistic_formula(X_train, y_train)
+        model_name = "calibrated_logistic_formula"
     
     # Evaluate
     metrics = evaluate_model(clf, X_train, y_train, X_test, y_test, feature_cols)
@@ -512,6 +607,7 @@ def main(csv_path: str = None, ablation: bool = False):
         "model": clf,
         "feature_cols": feature_cols,
         "metrics": metrics,
+        "model_type": model_name,
         "timestamp": datetime.now().isoformat(),
     }
     
@@ -535,6 +631,21 @@ if __name__ == "__main__":
         "--ablation", action="store_true",
         help="Run ablation study with different feature subsets"
     )
+    parser.add_argument(
+        "--model", type=str, default="calibrated", choices=["calibrated", "rf"],
+        help="Model formula to train: calibrated (default) or rf"
+    )
+    parser.add_argument(
+        "--include-simulated",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include CSVs from simulated_data/ when auto-merging datasets",
+    )
     args = parser.parse_args()
     
-    main(csv_path=args.csv, ablation=args.ablation)
+    main(
+        csv_path=args.csv,
+        ablation=args.ablation,
+        model_type=args.model,
+        include_simulated=args.include_simulated,
+    )

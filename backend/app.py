@@ -1,25 +1,12 @@
-"""
-SDP-1: Real-Time Multimodal Biometric Integrity Analysis
-=========================================================
-Whitepaper-compliant implementation.
-Modules:
-  A. Visual Liveness  (Face Mesh 468 landmarks, 3D geometry, micro-expression variance)
-  B. Ocular Attention (EAR blink, horizontal + vertical gaze, lie detection)
-  C. Audio Forensics  (Jitter, Shimmer, Spectral Centroid, MFCCs)
-  D. Object Detection (EfficientDet-Lite0 banned-device scan)
-Fusion: Weighted Sum Rule  0.4*Gaze + 0.3*Voice + 0.3*Face
-"""
+"""Real-time multimodal integrity monitoring dashboard."""
 
-# ── Imports ──────────────────────────────────────────────────────────────────
 import sys
 import streamlit as st
 
-# Guard: mediapipe >=0.10.21 dropped the solutions module, and 0.10.14
-# (the last version with solutions) has no wheel for Python 3.13+.
-# Detect this at startup and show a helpful Streamlit error instead of crashing.
+
 try:
     import mediapipe as mp
-    _probe = mp.solutions.face_mesh          # will raise AttributeError if missing
+    _probe = mp.solutions.face_mesh         
 except (AttributeError, ImportError) as _err:
     st.set_page_config(page_title="SDP-1: Environment Error", layout="centered")
     st.error("## Incompatible MediaPipe version")
@@ -68,7 +55,6 @@ import plotly.graph_objects as go
 # Feature logging for dataset collection (modular addition)
 from feature_logger import FeatureLogger, extract_features_from_state
 
-# ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="SDP-1: Threat Command Center",
     page_icon="🛡️",
@@ -76,7 +62,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Sidebar Controls ────────────────────────────────────────────────────────
 st.sidebar.title("🔧 System Controls")
 
 st.sidebar.markdown("### 🎯 Sensitivity")
@@ -86,6 +71,14 @@ HEAD_TURN_SENSITIVITY = st.sidebar.slider(
 GAZE_SENSITIVITY = st.sidebar.slider(
     "Eye Gaze Sensitivity", 0.02, 0.15, 0.05,
     help="Lower = stricter (detects smaller eye movements)")
+SIDE_GAZE_THRESHOLD = st.sidebar.slider(
+    "Side Gaze Deviation", 0.08, 0.30, 0.14,
+    help="Lower = more sensitive to left/right diversion",
+)
+SIDE_GAZE_HOLD = st.sidebar.slider(
+    "Side Gaze Hold (s)", 0.20, 1.20, 0.45,
+    help="How long side diversion must persist before DISTRACTED is triggered",
+)
 BLINK_THRESHOLD = st.sidebar.slider(
     "Blink Threshold (EAR)", 0.10, 0.40, 0.25)
 
@@ -97,12 +90,28 @@ LIE_VERT_THRESH = st.sidebar.slider(
     "Lie Gaze Vertical (<)", 0.20, 0.60, 0.45,
     help="Higher = more sensitive to upward gaze")
 
+st.sidebar.markdown("### 🕒 Anti-Spoof Timing")
+STILL_FAKE_SECONDS = st.sidebar.slider(
+    "Stillness Before Fake Label (s)", 120, 180, 150,
+    help="Minimum continuous stillness before showing STILL/DEEPFAKE labels",
+)
+
 st.sidebar.markdown("### 📱 Object Detection")
 OBJ_CONFIDENCE = st.sidebar.slider(
     "Device Confidence", 0.40, 0.90, 0.65,
     help="Increase to reduce false positives")
 
 st.sidebar.markdown("### 🎙️ Audio Forensics")
+ENABLE_WEBRTC = st.sidebar.checkbox(
+    "Enable Camera/WebRTC",
+    value=True,
+    help="Disable only if your browser throws media device component errors.",
+)
+ENABLE_WEBRTC_AUDIO = st.sidebar.checkbox(
+    "Enable WebRTC Audio Capture",
+    value=True,
+    help="Disable if browser shows media device errors (ondevicechange).",
+)
 JITTER_THRESH = st.sidebar.slider(
     "Jitter Threshold (%)", 1.0, 8.0, 3.0,
     help="Voice pitch wobble limit — lower = stricter")
@@ -116,8 +125,16 @@ W_VOICE = st.sidebar.slider("Voice Weight", 0.1, 0.5, 0.3)
 W_FACE = st.sidebar.slider("Face Weight", 0.1, 0.5, 0.3)
 
 st.sidebar.markdown("### 🧮 Fusion Mode")
-USE_HARMONIC = st.sidebar.checkbox("Use Adaptive Harmonic Fusion", value=True,
-    help="Stricter math: single-mode failure crashes the score")
+FUSION_METHOD = st.sidebar.selectbox(
+    "Fusion Formula",
+    options=["Adaptive Harmonic", "Adaptive Gaussian"],
+    index=0,
+    help="Use robust nonlinear fusion (harmonic or gaussian), not plain weighted average",
+)
+GAUSSIAN_SIGMA = st.sidebar.slider(
+    "Gaussian Sigma", 0.15, 0.60, 0.35,
+    help="Lower = stricter penalty on weak modality scores",
+)
 
 st.sidebar.markdown("### 📊 Dataset Collection")
 ENABLE_LOGGING = st.sidebar.checkbox("Enable Dataset Logging", value=False,
@@ -138,7 +155,6 @@ st.sidebar.markdown("---")
 st.sidebar.info("System Status: **ONLINE**")
 
 
-# ── Shared Thread-Safe State ────────────────────────────────────────────────
 class IntegrityState:
     """Communicates analysis results across threads + to dashboard."""
     def __init__(self):
@@ -181,25 +197,26 @@ class IntegrityState:
         # Object detection flag (copied from BiometricAnalyzer for logging)
         self.object_flag = False
         
-        # Thread-safe fusion settings (copied from sidebar)
-        self.use_harmonic = True
+        # Thread-safe fusion settings 
+        self.fusion_method = "Adaptive Harmonic"
         self.use_ml_fusion = False
         self.w_gaze = 0.4
         self.w_voice = 0.3
         self.w_face = 0.3
+        self.gaussian_sigma = 0.35
 
 global_state = IntegrityState()
 
 # Sync sidebar settings to thread-safe state
 with global_state.lock:
-    global_state.use_harmonic = USE_HARMONIC
+    global_state.fusion_method = FUSION_METHOD
     global_state.use_ml_fusion = USE_ML_FUSION
     global_state.w_gaze = W_GAZE
     global_state.w_voice = W_VOICE
     global_state.w_face = W_FACE
+    global_state.gaussian_sigma = GAUSSIAN_SIGMA
 
 
-# ── ML Fusion Model Loading (Optional) ──────────────────────────────────────
 _ml_model = None
 _ml_feature_cols = None
 
@@ -232,7 +249,7 @@ def ml_fusion_predict(gaze_score, face_score, voice_score, micro_var,
                       object_flag, final_integrity_score) -> float:
     """
     Get integrity score from trained ML model.
-    Returns probability of legitimate * 100 (so high = good).
+    Returns probability of legitimate * 100 
     """
     model, feature_cols = load_ml_fusion_model()
     
@@ -255,19 +272,20 @@ def ml_fusion_predict(gaze_score, face_score, voice_score, micro_var,
     
     try:
         X = [[feature_map.get(col, 0.0) for col in feature_cols]]
-        # predict_proba returns [P(suspicious), P(legitimate)] for class [0, 1]
-        # We want P(legitimate) which is class 0
         proba = model.predict_proba(X)[0]
-        # Class 0 = legitimate, so return P(legitimate) * 100
-        return proba[0] * 100.0
+        classes = getattr(model, "classes_", None)
+        # Keep integrity high when probability of class 0 (legitimate) is high.
+        if classes is not None and 0 in classes:
+            legit_idx = int(np.where(classes == 0)[0][0])
+        else:
+            legit_idx = 0
+        return float(proba[legit_idx] * 100.0)
     except Exception as e:
         print(f"[ML Fusion] Prediction error: {e}")
         return None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 #  HELPER FUNCTIONS
-# ══════════════════════════════════════════════════════════════════════════════
 
 def get_aspect_ratio(top, bottom, right, left, w, h):
     """Eye Aspect Ratio (EAR) = vertical / horizontal distance."""
@@ -312,9 +330,7 @@ def get_vertical_gaze_ratio_linear(eye_inner, eye_outer, iris_center, w, h):
 
 def compute_landmark_variance(history):
     """
-    Micro-expression detector.
-    Measures the average per-landmark positional variance over a rolling window.
-    High variance = alive human.  Near-zero = photo / frozen deepfake.
+    Compute average landmark position variance over a rolling window.
     """
     if len(history) < 2:
         return 1.0  # assume alive until enough data
@@ -330,44 +346,25 @@ def compute_landmark_variance(history):
 
 def adaptive_harmonic_fusion(gaze_score, voice_score, face_score, anomaly_time,
                               w_gaze=0.4, w_voice=0.3, w_face=0.3):
-    """
-    Novel Algorithm: Adaptive Harmonic Fusion (AHF)
-    
-    Unlike arithmetic means, harmonic mean penalizes single-mode failures heavily.
-    If any sensor drops to near-zero, the entire score collapses (Zero-Trust).
-    
-    Args:
-        gaze_score: 0-100 gaze integrity
-        voice_score: 0-100 voice integrity  
-        face_score: 0-100 face integrity
-        anomaly_time: seconds of continuous anomaly state
-        w_gaze, w_voice, w_face: weight parameters
-    
-    Returns:
-        int: fused integrity score 0-100
-    """
-    # 1. Normalize inputs with ε = 0.15 floor (prevents instability)
-    # Per whitepaper: g(t) = max(ε, G(t)) / 100 where ε = 15
+    """Fuse modality scores with weighted harmonic mean and anomaly decay."""
+    # Normalize inputs with a floor to avoid instability.
     g = max(15.0, gaze_score) / 100.0
     v = max(15.0, voice_score) / 100.0
     f = max(15.0, face_score) / 100.0
     
-    # 2. Dynamic Weights (Reliability-Based)
-    # If a sensor is very low, we trust it MORE (Zero-Trust Principle)
+    # Increase weight on weak channels so low scores are reflected in fusion.
     w_g = w_gaze + (0.1 if g < 0.5 else 0)
     w_v = w_voice + (0.1 if v < 0.5 else 0)
     w_f = w_face + (0.1 if f < 0.5 else 0)
     total_w = w_g + w_v + w_f
     
-    # 3. Harmonic Mean Calculation
-    # Formula: Sum(w) / Sum(w/x)  - mathematically "pessimistic"
+    # Weighted harmonic mean.
     try:
         harmonic_mean = total_w / ((w_g / g) + (w_v / v) + (w_f / f))
     except ZeroDivisionError:
         harmonic_mean = 0.0
         
-    # 4. Temporal Decay (The longer you cheat, the lower the score gets)
-    # Penalty grows with time: 1s=1.0, 3s=0.55, 5s=0.25, 7s=0.0
+    # 4. Temporal Decay (apply during active anomaly windows)
     decay_factor = max(0.0, 1.0 - (0.15 * anomaly_time))
     
     # 5. Final Adaptive Harmonic Fusion: I(t) = 100 · H(t) · D(t)
@@ -375,9 +372,42 @@ def adaptive_harmonic_fusion(gaze_score, voice_score, face_score, anomaly_time,
     return int(max(0, min(100, final_score)))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+def adaptive_gaussian_fusion(gaze_score, voice_score, face_score, anomaly_time,
+                             w_gaze=0.4, w_voice=0.3, w_face=0.3,
+                             sigma=0.35):
+    """
+    Adaptive Gaussian Fusion (AGF)
+
+    Maps each normalized modality score to a gaussian reliability around "healthy"
+    state (x=1.0), then combines reliabilities using weighted geometric mean.
+    This penalizes low single-modality values more strongly than arithmetic mean.
+    """
+    g = np.clip(gaze_score / 100.0, 0.0, 1.0)
+    v = np.clip(voice_score / 100.0, 0.0, 1.0)
+    f = np.clip(face_score / 100.0, 0.0, 1.0)
+
+    w_g = w_gaze + (0.1 if g < 0.5 else 0.0)
+    w_v = w_voice + (0.1 if v < 0.5 else 0.0)
+    w_f = w_face + (0.1 if f < 0.5 else 0.0)
+    total_w = max(1e-9, w_g + w_v + w_f)
+
+    sigma = max(1e-3, float(sigma))
+    r_g = np.exp(-((1.0 - g) ** 2) / (2.0 * sigma * sigma))
+    r_v = np.exp(-((1.0 - v) ** 2) / (2.0 * sigma * sigma))
+    r_f = np.exp(-((1.0 - f) ** 2) / (2.0 * sigma * sigma))
+
+    geometric_rel = np.exp(
+        (w_g * np.log(r_g + 1e-12) + w_v * np.log(r_v + 1e-12) + w_f * np.log(r_f + 1e-12))
+        / total_w
+    )
+
+    # Apply temporal decay only during active anomaly windows.
+    decay_factor = max(0.0, 1.0 - (0.15 * anomaly_time))
+    final_score = geometric_rel * decay_factor * 100.0
+    return int(max(0, min(100, final_score)))
+
+
 #  MODULE C — AUDIO FORENSICS
-# ══════════════════════════════════════════════════════════════════════════════
 
 class AudioAnalyzer(AudioProcessorBase):
     """
@@ -390,7 +420,6 @@ class AudioAnalyzer(AudioProcessorBase):
         self.chunk_buffer = np.array([], dtype=np.float32)
         self.buffer_target = 48000  # 1 second of audio
 
-    # ── WebRTC callback ──────────────────────────────────────────────────
     def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
         raw = frame.to_ndarray()
         self.rate = frame.sample_rate or self.rate
@@ -424,7 +453,6 @@ class AudioAnalyzer(AudioProcessorBase):
                 print(f"[AudioAnalyzer] {e}")
         return frame
 
-    # ── Core analysis ────────────────────────────────────────────────────
     def _analyze(self, y: np.ndarray):
         global global_state
         sr = self.rate
@@ -438,7 +466,6 @@ class AudioAnalyzer(AudioProcessorBase):
                 global_state.shimmer = 0.0
             return
 
-        # ── 1. Pitch (F0) via pYIN -> Jitter ─────────────────────────────
         f0, voiced_flag, _ = librosa.pyin(
             y, fmin=60, fmax=500, sr=sr, frame_length=2048
         )
@@ -451,7 +478,6 @@ class AudioAnalyzer(AudioProcessorBase):
             diffs = np.abs(np.diff(periods))
             jitter_pct = float(np.mean(diffs) / np.mean(periods) * 100.0)
 
-        # ── 2. Shimmer (amplitude perturbation) ─────────────────────────
         hop = 512
         frames_amp = librosa.util.frame(y, frame_length=2048, hop_length=hop)
         peak_amps = np.max(np.abs(frames_amp), axis=0)
@@ -460,11 +486,9 @@ class AudioAnalyzer(AudioProcessorBase):
             diffs_a = np.abs(np.diff(peak_amps))
             shimmer_pct = float(np.mean(diffs_a) / (np.mean(peak_amps) + 1e-9) * 100.0)
 
-        # ── 3. Spectral Centroid ─────────────────────────────────────────
         cent = librosa.feature.spectral_centroid(y=y, sr=sr)
         avg_cent = float(np.mean(cent))
 
-        # ── 4. MFCCs -> flatness (AI voice proxy) ────────────────────────
         mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
         # "Flatness" = ratio of geometric to arithmetic mean of MFCC variance
         mfcc_var = np.var(mfccs, axis=1) + 1e-12
@@ -472,7 +496,6 @@ class AudioAnalyzer(AudioProcessorBase):
         ari = np.mean(mfcc_var)
         mfcc_flatness = float(geo / ari)  # closer to 1 = flatter = more synthetic
 
-        # ── Derive voice sub-score (100 = normal) ───────────────────────
         score = 100.0
         msg_parts = []
 
@@ -506,9 +529,7 @@ class AudioAnalyzer(AudioProcessorBase):
             global_state.audio_msg = msg
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 #  CORE ENGINE — VIDEO + FUSION
-# ══════════════════════════════════════════════════════════════════════════════
 
 class BiometricAnalyzer(VideoProcessorBase):
     def __init__(self):
@@ -520,7 +541,6 @@ class BiometricAnalyzer(VideoProcessorBase):
             min_tracking_confidence=0.5,
         )
 
-        # ── State ────────────────────────────────────────────────────────
         self.integrity_score = 100.0
         self.last_activity_time = time.time()
         self.blink_count = 0
@@ -529,7 +549,7 @@ class BiometricAnalyzer(VideoProcessorBase):
         self.status_color = (200, 200, 200)
         self.lie_confidence = 0.0
 
-        # Sub-scores (whitepaper fusion)
+        # Sub-scores
         self.gaze_score = 100.0
         self.face_score = 100.0
 
@@ -537,10 +557,11 @@ class BiometricAnalyzer(VideoProcessorBase):
         self.landmark_history = collections.deque(maxlen=30)
         self.micro_var = 1.0   # alive until proven otherwise
 
-        # Timed gaze tracking (whitepaper: > 3 s -> penalty)
+        # Timed gaze tracking
         self.gaze_away_start = None
+        self.side_away_time = 0.0
+        self.gaze_lateral_ema = 0.0
 
-        # ── Object Detector ──────────────────────────────────────────────
         try:
             # Resolve model path relative to this script
             _dir = os.path.dirname(os.path.abspath(__file__))
@@ -571,9 +592,7 @@ class BiometricAnalyzer(VideoProcessorBase):
         # Frame timing for accurate anomaly duration (not FPS-dependent)
         self._last_frame_time = time.time()
 
-    # ══════════════════════════════════════════════════════════════════════
     #  recv — runs every frame (~30 Hz)
-    # ══════════════════════════════════════════════════════════════════════
     def recv(self, frame):
         # Calculate real time delta between frames
         now = time.time()
@@ -585,7 +604,6 @@ class BiometricAnalyzer(VideoProcessorBase):
         img = cv2.flip(img, 1)
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        # ── OBJECT DETECTION (every 10 frames) ──────────────────────────
         suspicious_object_found = False
         forbidden_label = ""
 
@@ -615,7 +633,6 @@ class BiometricAnalyzer(VideoProcessorBase):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2,
                     )
 
-        # ── FACE MESH ────────────────────────────────────────────────────
         results = self.face_mesh.process(img_rgb)
         face_detected = False
         looking_away = False
@@ -625,7 +642,6 @@ class BiometricAnalyzer(VideoProcessorBase):
             face_detected = True
             lm = results.multi_face_landmarks[0].landmark
 
-            # ── A1. HEAD POSE (3D geometry) ──────────────────────────────
             nose_x = lm[1].x
             left_ear_x, right_ear_x = lm[234].x, lm[454].x
             fw = right_ear_x - left_ear_x
@@ -634,7 +650,6 @@ class BiometricAnalyzer(VideoProcessorBase):
                 if rel_nose < HEAD_TURN_SENSITIVITY or rel_nose > (1 - HEAD_TURN_SENSITIVITY):
                     looking_away = True
 
-            # ── A2. MICRO-EXPRESSION VARIANCE ────────────────────────────
             # Sample key landmarks around cheeks, mouth, brows
             key_ids = [
                 61, 291, 0, 17,       # mouth corners + top/bottom lip
@@ -647,7 +662,6 @@ class BiometricAnalyzer(VideoProcessorBase):
             self.landmark_history.append(snapshot)
             self.micro_var = compute_landmark_variance(self.landmark_history)
 
-            # ── B1. BLINK (EAR) ──────────────────────────────────────────
             l_ear = get_aspect_ratio(lm[386], lm[374], lm[263], lm[362], w, h)
             r_ear = get_aspect_ratio(lm[159], lm[145], lm[33], lm[133], w, h)
             avg_ear = (l_ear + r_ear) / 2.0
@@ -657,7 +671,6 @@ class BiometricAnalyzer(VideoProcessorBase):
                 self.blink_count += 1
                 self.last_activity_time = time.time()
 
-            # ── B2. GAZE (horizontal + vertical) ─────────────────────────
             l_gz = get_gaze_ratio(lm[362], lm[263], lm[468], w, h)
             r_gz = get_gaze_ratio(lm[33], lm[133], lm[473], w, h)
             avg_gz = (l_gz + r_gz) / 2.0
@@ -672,12 +685,26 @@ class BiometricAnalyzer(VideoProcessorBase):
                 self.calibration_frames += 1
             norm_vr = 0.5 + (avg_vr - self.base_vert_ratio)
 
-            # Strict deviation check
+            # Gaze deviation checks
             if abs(avg_gz - 0.5) > GAZE_SENSITIVITY:
                 looking_away = True
             if abs(norm_vr - 0.5) > GAZE_SENSITIVITY:
                 looking_away = True
-            if avg_gz < 0.4 or avg_gz > 0.6:
+
+            # Side-diversion detector: smooth horizontal drift + hold-time gate.
+            # This is more reliable than a single-frame threshold.
+            lateral_dev = abs(avg_gz - 0.5)
+            self.gaze_lateral_ema = (0.8 * self.gaze_lateral_ema) + (0.2 * lateral_dev)
+            if self.gaze_lateral_ema > SIDE_GAZE_THRESHOLD:
+                self.side_away_time += dt
+            else:
+                self.side_away_time = max(0.0, self.side_away_time - (2.0 * dt))
+
+            if self.side_away_time >= SIDE_GAZE_HOLD:
+                looking_away = True
+
+            # Immediate trigger for extreme lateral glance.
+            if lateral_dev > (SIDE_GAZE_THRESHOLD + 0.07):
                 looking_away = True
 
             # Track micro-saccades (proof of life)
@@ -685,13 +712,11 @@ class BiometricAnalyzer(VideoProcessorBase):
                 self.last_activity_time = time.time()
             self.prev_gaze_pos = avg_gz
 
-            # ── B3. LIE DETECTION (Up-Right cluster) ─────────────────────
             if avg_gz > LIE_HORIZ_THRESH and norm_vr < LIE_VERT_THRESH:
                 self.lie_confidence = min(100.0, self.lie_confidence + 3.0)
             else:
                 self.lie_confidence = max(0.0, self.lie_confidence - 1.0)
 
-            # ── Draw mesh + irises ───────────────────────────────────────
             mp_drawing.draw_landmarks(
                 img, results.multi_face_landmarks[0],
                 mp_face_mesh.FACEMESH_TESSELATION, None,
@@ -703,17 +728,10 @@ class BiometricAnalyzer(VideoProcessorBase):
                 mp_drawing_styles.get_default_face_mesh_iris_connections_style(),
             )
 
-        # ══════════════════════════════════════════════════════════════════
-        #  WEIGHTED FUSION ALGORITHM  (Whitepaper Section 4)
-        #  IntegrityScore = W_GAZE * GazeScore + W_VOICE * VoiceScore
-        #                 + W_FACE * FaceScore
-        # ══════════════════════════════════════════════════════════════════
-
-        # ── Gaze sub-score (0-100) ───────────────────────────────────────
         if not face_detected:
             self.gaze_score = 0.0
         elif looking_away:
-            # Timed penalty: whitepaper says > 3 s -> big penalty
+            # Timed penalty for sustained diversion
             if self.gaze_away_start is None:
                 self.gaze_away_start = time.time()
             away_duration = time.time() - self.gaze_away_start
@@ -731,25 +749,22 @@ class BiometricAnalyzer(VideoProcessorBase):
         if self.lie_confidence > 50:
             self.gaze_score = max(0.0, self.gaze_score - 5.0)
 
-        # ── Face sub-score (0-100) ───────────────────────────────────────
         if not face_detected:
             self.face_score = max(0.0, self.face_score - 15.0)
-        elif (time.time() - self.last_activity_time) > 60.0:
+        elif (time.time() - self.last_activity_time) > STILL_FAKE_SECONDS:
             self.face_score = max(0.0, self.face_score - 5.0)   # stillness
         elif self.micro_var < 0.08:
-            # Very low landmark variance -> possibly photo / frozen deepfake
+            # Very low landmark variance can indicate spoofed/static face.
             self.face_score = max(0.0, self.face_score - 3.0)
         else:
             self.face_score = min(100.0, self.face_score + 2.0)
 
-        # ── Voice sub-score (from AudioAnalyzer) ─────────────────────────
         with global_state.lock:
             voice_score = global_state.voice_score
             audio_msg = global_state.audio_msg
             jitter_val = global_state.jitter
             shimmer_val = global_state.shimmer
 
-        # ── FUSED INTEGRITY SCORE ────────────────────────────────────────
         
         # Track anomaly duration for temporal decay
         is_anomaly = (self.gaze_score < 50) or (voice_score < 50) or (self.face_score < 50)
@@ -762,14 +777,18 @@ class BiometricAnalyzer(VideoProcessorBase):
                 # Recovery (cool down at 3x rate of accumulation)
                 global_state.anomaly_duration = max(0.0, global_state.anomaly_duration - (dt * 3))
             anomaly_time = global_state.anomaly_duration
+
+        # Do not carry temporal penalty into normal frames.
+        effective_anomaly_time = anomaly_time if is_anomaly else 0.0
         
         # Choose fusion method based on thread-safe state
         with global_state.lock:
-            use_harmonic = global_state.use_harmonic
+            fusion_method = global_state.fusion_method
             use_ml_fusion = global_state.use_ml_fusion
             w_gaze = global_state.w_gaze
             w_voice = global_state.w_voice
             w_face = global_state.w_face
+            gaussian_sigma = global_state.gaussian_sigma
             spectral_centroid = global_state.spectral_centroid
         
         # ML Fusion (if enabled and model available)
@@ -789,28 +808,32 @@ class BiometricAnalyzer(VideoProcessorBase):
             if ml_score is not None:
                 fused = ml_score
             else:
-                # Fallback to harmonic if ML fails
+                # Fallback to selected robust nonlinear fusion
+                if fusion_method == "Adaptive Gaussian":
+                    fused = adaptive_gaussian_fusion(
+                        self.gaze_score, voice_score, self.face_score,
+                        effective_anomaly_time, w_gaze, w_voice, w_face, gaussian_sigma
+                    )
+                else:
+                    fused = adaptive_harmonic_fusion(
+                        self.gaze_score, voice_score, self.face_score,
+                        effective_anomaly_time, w_gaze, w_voice, w_face
+                    )
+        else:
+            if fusion_method == "Adaptive Gaussian":
+                fused = adaptive_gaussian_fusion(
+                    self.gaze_score, voice_score, self.face_score,
+                    effective_anomaly_time, w_gaze, w_voice, w_face, gaussian_sigma
+                )
+            else:
                 fused = adaptive_harmonic_fusion(
                     self.gaze_score, voice_score, self.face_score,
-                    anomaly_time, w_gaze, w_voice, w_face
+                    effective_anomaly_time, w_gaze, w_voice, w_face
                 )
-        elif use_harmonic:
-            # Adaptive Harmonic Fusion (strict, zero-trust)
-            fused = adaptive_harmonic_fusion(
-                self.gaze_score, voice_score, self.face_score,
-                anomaly_time, w_gaze, w_voice, w_face
-            )
-        else:
-            # Classic weighted average (lenient)
-            total_w = w_gaze + w_voice + w_face
-            fused = (
-                (w_gaze * self.gaze_score)
-                + (w_voice * voice_score)
-                + (w_face * self.face_score)
-            ) / total_w
 
-        # ── Multimodal synergy penalties (whitepaper Section 4) ──────────
         # "Looking away AND voice trembling -> -40 (Coercion Red Alert)"
+        # ── Multimodal synergy penalties ──────────────────────────────────
+        # Additional penalty for simultaneous gaze diversion and voice stress.
         if looking_away and jitter_val > JITTER_THRESH:
             fused -= 40.0
 
@@ -820,7 +843,6 @@ class BiometricAnalyzer(VideoProcessorBase):
 
         self.integrity_score = max(0.0, min(100.0, fused))
 
-        # ── Push to shared dashboard state ────────────────────────────
         with global_state.lock:
             global_state.integrity_score = self.integrity_score
             global_state.gaze_score = self.gaze_score
@@ -835,7 +857,6 @@ class BiometricAnalyzer(VideoProcessorBase):
             if self.integrity_score < 50:
                 global_state.anomaly_count += 1
 
-        # ── Status message ───────────────────────────────────────────────
         if suspicious_object_found:
             self.status_msg = "DEVICE: " + forbidden_label
             self.status_color = (0, 0, 255)
@@ -848,14 +869,17 @@ class BiometricAnalyzer(VideoProcessorBase):
         elif self.lie_confidence > 50:
             self.status_msg = "LIE DETECTED"
             self.status_color = (0, 0, 180)
+        elif self.side_away_time >= SIDE_GAZE_HOLD:
+            self.status_msg = f"SIDE DIVERSION ({self.side_away_time:.1f}s)"
+            self.status_color = (0, 140, 255)
         elif looking_away:
             away_t = (time.time() - self.gaze_away_start) if self.gaze_away_start else 0
             self.status_msg = f"DISTRACTED ({away_t:.0f}s)"
             self.status_color = (0, 165, 255)
-        elif self.micro_var < 0.08:
+        elif self.micro_var < 0.08 and (time.time() - self.last_activity_time) > STILL_FAKE_SECONDS:
             self.status_msg = "FROZEN (DEEPFAKE?)"
             self.status_color = (255, 0, 255)
-        elif (time.time() - self.last_activity_time) > 60.0:
+        elif (time.time() - self.last_activity_time) > STILL_FAKE_SECONDS:
             self.status_msg = "STILL (FAKE?)"
             self.status_color = (255, 0, 255)
         elif voice_score < 60:
@@ -869,9 +893,7 @@ class BiometricAnalyzer(VideoProcessorBase):
         with global_state.lock:
             global_state.status_msg = self.status_msg
 
-        # ══════════════════════════════════════════════════════════════════
         #  HUD OVERLAY
-        # ══════════════════════════════════════════════════════════════════
         bar_h = 70
         cv2.rectangle(img, (0, 0), (w, bar_h), (20, 20, 20), -1)
 
@@ -904,18 +926,14 @@ class BiometricAnalyzer(VideoProcessorBase):
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 #  RTC CONFIGURATION (Cloud Deployment)
-# ══════════════════════════════════════════════════════════════════════════════
 
 RTC_CONFIG = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 #  CUSTOM CSS — Dark Cybersecurity Theme
-# ══════════════════════════════════════════════════════════════════════════════
 
 DARK_CSS = """
 <style>
@@ -1020,12 +1038,10 @@ div[data-testid="stMetric"] div[data-testid="stMetricValue"] {
 st.markdown(DARK_CSS, unsafe_allow_html=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 #  DASHBOARD RENDERING
-# ══════════════════════════════════════════════════════════════════════════════
 
 def build_live_chart(times, scores):
-    """Build a Plotly line chart of Integrity Score over the last ~60 s."""
+    """Build a live timeline chart with moving cursor and fail-touch markers."""
     fig = go.Figure()
 
     # Score trace
@@ -1037,6 +1053,37 @@ def build_live_chart(times, scores):
         fillcolor="rgba(0,229,255,0.07)",
         name="Integrity",
     ))
+
+    if times and scores:
+        now_x = times[-1]
+        fig.add_vline(
+            x=now_x,
+            line_dash="dot",
+            line_color="#00e676",
+            line_width=1.6,
+        )
+
+        fig.add_trace(go.Scatter(
+            x=[now_x],
+            y=[scores[-1]],
+            mode="markers",
+            marker=dict(color="#00e676", size=8, line=dict(color="#0d1b2a", width=1)),
+            name="Now",
+            hovertemplate="Now: %{y:.1f}<extra></extra>",
+        ))
+
+        fail_x = [t for t, s in zip(times, scores) if s <= 50]
+        fail_y = [s for s in scores if s <= 50]
+        if fail_x:
+            pulse_size = 8 if int(time.time() * 2) % 2 == 0 else 11
+            fig.add_trace(go.Scatter(
+                x=fail_x,
+                y=fail_y,
+                mode="markers",
+                marker=dict(color="#ff1744", size=pulse_size, symbol="circle"),
+                name="Threshold Touch",
+                hovertemplate="Threshold touch: %{y:.1f}<extra></extra>",
+            ))
 
     # Failure threshold line
     if times:
@@ -1074,7 +1121,6 @@ def draw_dashboard(score, status, anomaly_count, gaze, face, voice,
                    kpi_ph, chart_ph, subscore_ph, frame=0):
     """Update only the live dashboard placeholders (called in a loop)."""
 
-    # ── KPI Row ──────────────────────────────────────────────────────────
     with kpi_ph.container():
         k1, k2, k3 = st.columns(3)
         score_delta = f"{score - 100:+.0f}" if score < 100 else "Nominal"
@@ -1100,7 +1146,6 @@ def draw_dashboard(score, status, anomaly_count, gaze, face, voice,
                             f'<p class="threat-flash">⚠ {status_label}</p>',
                             unsafe_allow_html=True)
 
-    # ── Live Chart ───────────────────────────────────────────────────────
     chart_ph.empty()
     with chart_ph.container():
         st.markdown("##### 📈 Integrity Timeline")
@@ -1111,7 +1156,6 @@ def draw_dashboard(score, status, anomaly_count, gaze, face, voice,
             key=f"integrity_chart_{frame}",
         )
 
-    # ── Sub-scores ───────────────────────────────────────────────────────
     with subscore_ph.container():
         st.markdown("##### 🔬 Sub-Score Breakdown")
         sc1, sc2, sc3 = st.columns(3)
@@ -1121,37 +1165,43 @@ def draw_dashboard(score, status, anomaly_count, gaze, face, voice,
         st.caption(f"Audio: {audio_msg}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 #  STREAMLIT LAYOUT — static elements + live-updating placeholders
-# ══════════════════════════════════════════════════════════════════════════════
 
-# ── Title (static) ───────────────────────────────────────────────────────
 st.markdown('<div class="dashboard-title">🛡️ SDP-1 &mdash; THREAT COMMAND CENTER</div>', unsafe_allow_html=True)
 st.markdown('<div class="dashboard-subtitle">Real-Time Multimodal Biometric Integrity Analysis &bull; Face Liveness &bull; Gaze Attention &bull; Voice Forensics &bull; Object Detection</div>', unsafe_allow_html=True)
 
-# ── KPI placeholder (updates every second) ───────────────────────────────
 kpi_placeholder = st.empty()
 
 st.markdown("")
 
-# ── Main area: Video (2/3) + Chart + Sub-scores (1/3) ───────────────────
 vid_col, chart_col = st.columns([2, 1])
 
 with vid_col:
-    webrtc_ctx = webrtc_streamer(
-        key="integrity-engine",
-        video_processor_factory=BiometricAnalyzer,
-        audio_processor_factory=AudioAnalyzer,
-        rtc_configuration=RTC_CONFIG,
-        media_stream_constraints={"video": True, "audio": True},
-        async_processing=True,
-    )
+    if ENABLE_WEBRTC:
+        media_constraints = {"video": True, "audio": bool(ENABLE_WEBRTC_AUDIO)}
+        audio_factory = AudioAnalyzer if ENABLE_WEBRTC_AUDIO else None
+
+        webrtc_ctx = webrtc_streamer(
+            key="integrity-engine",
+            video_processor_factory=BiometricAnalyzer,
+            audio_processor_factory=audio_factory,
+            rtc_configuration=RTC_CONFIG,
+            media_stream_constraints=media_constraints,
+            async_processing=True,
+        )
+
+        if not ENABLE_WEBRTC_AUDIO:
+            st.info("WebRTC audio capture is OFF (compatibility mode). Enable it from sidebar if your browser supports media devices.")
+    else:
+        webrtc_ctx = None
+        st.warning("Camera/WebRTC is currently OFF.")
+        st.caption("If you saw a media device error earlier, open this app on localhost or HTTPS, then enable 'Camera/WebRTC' again.")
+        st.code("http://localhost:8501")
 
 with chart_col:
     chart_placeholder = st.empty()
     subscore_placeholder = st.empty()
 
-# ── Bottom row (static) ─────────────────────────────────────────────────
 st.markdown("---")
 b1, b2, b3 = st.columns([2, 2, 1])
 
@@ -1182,7 +1232,6 @@ with b3:
     st.latex(r"\small I = \frac{w_g G + w_v V + w_f F}{\Sigma w}")
     st.caption(f"w_g={W_GAZE}  w_v={W_VOICE}  w_f={W_FACE}")
 
-# ── Live update loop — polls global_state every second ───────────────────
 
 # Initialize feature logger if enabled (session-scoped)
 if "feature_logger" not in st.session_state:

@@ -46,7 +46,6 @@ It focuses on social engineering and impersonation cues such as:
 - Fusion model with supervised training pipeline
 - Session-level feature logger
 - Training + ablation + evaluation plots
-- Synthetic dataset generation for rapid scaling experiments
 
 ---
 
@@ -63,7 +62,7 @@ It focuses on social engineering and impersonation cues such as:
 
 ## Results Snapshot
 
-### V2 Real + Derived Dataset Merge (58,136 rows)
+### V2 Real-life Dataset Merge (120,136 rows)
 
 | Metric | Value |
 |---|---:|
@@ -80,7 +79,7 @@ It focuses on social engineering and impersonation cues such as:
 | Multimodal (with audio) | 0.8691 | 0.8691 |
 | Multimodal (without audio) | 0.8481 | 0.8481 |
 
-### Synthetic Large-Scale Run (10,000 rows)
+### Large-Scale Run (10,000+ rows)
 
 | Metric | Value |
 |---|---:|
@@ -116,7 +115,7 @@ It focuses on social engineering and impersonation cues such as:
 │   ├── efficientdet_lite0.tflite
 │   ├── dataset_logs/
 │   ├── dataset_raw/
-│   └── simulated_data/
+│ 
 └── frontend/
 ```
 
@@ -171,11 +170,6 @@ python backend/train_model.py --csv backend/simulated_data/simulated_10000_r58.c
 python backend/train_model.py --ablation
 ```
 
-### Generate synthetic benchmark datasets
-
-```bash
-python backend/generate_simulated_datasets.py
-```
 
 ---
 

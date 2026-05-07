@@ -99,6 +99,17 @@ It focuses on social engineering and impersonation cues such as:
 
 ---
 
+## Future Prospects and Improvements
+
+- Expand session-aware evaluation to grouped cross-validation with per-user folds.
+- Add uncertainty calibration (temperature scaling) for smoother risk probabilities.
+- Introduce adaptive thresholds by environment context and device class.
+- Add model drift detection and periodic retraining triggers.
+- Optimize latency with batched inference and lightweight quantization.
+- Improve UX with transparent reason codes and confidence bands.
+
+---
+
 ## Project Structure
 
 ```text
@@ -169,7 +180,6 @@ python backend/train_model.py --csv backend/simulated_data/simulated_10000_r58.c
 ```bash
 python backend/train_model.py --ablation
 ```
-
 
 ---
 
